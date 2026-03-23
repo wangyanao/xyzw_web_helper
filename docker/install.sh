@@ -1,4 +1,10 @@
-## 导入镜像
-docker load ./xzyw_web_helper.docker
-## 运行容器
-docker run -d -p 8080:80 --name my_xyzw_web_helper xyzw_web_helper:latest
+# 3. 加载镜像
+docker load -i /tmp/xyzw-bin-server.tar
+
+# 4. 运行容器
+docker run -d \
+  -p 5001:5001 \
+  -v /data/xyzw-bins:/app/server/bin \
+  --name xyzw-bin-server \
+  --restart unless-stopped \
+  xyzw-bin-server:latest

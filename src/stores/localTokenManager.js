@@ -406,30 +406,9 @@ export const useLocalTokenStore = defineStore("localToken", () => {
 
   // 清理过期token
   const cleanExpiredTokens = () => {
-    const now = new Date();
-    const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-
-    const cleanedTokens = {};
-    let cleanedCount = 0;
-
-    Object.entries(gameTokens.value).forEach(([roleId, tokenData]) => {
-      const lastUsed = new Date(tokenData.lastUsed || tokenData.createdAt);
-      if (lastUsed > oneDayAgo) {
-        cleanedTokens[roleId] = tokenData;
-      } else {
-        cleanedCount++;
-        // 关闭对应的WebSocket连接
-        if (wsConnections.value[roleId]) {
-          closeWebSocketConnection(roleId);
-        }
-        // 从 DB 删除
-        dbDeleteGameToken(roleId).catch(() => {});
-      }
-    });
-
-    gameTokens.value = cleanedTokens;
-
-    return cleanedCount;
+    // ✅ 禁用自动过期删除逻辑（修复 Token 一天过期问题）
+    // Token 只在用户显式删除时才会被移除
+    return 0;  // 不删除任何 Token
   };
 
   // 初始化

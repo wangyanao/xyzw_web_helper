@@ -1,12 +1,20 @@
-FROM nginx:xyzw
+FROM python:3.11-slim
 
-VOLUME /app/web
-COPY ./dist /app/web
+# 安装 Python 依赖
+COPY ./server/requirements.txt /app/server/requirements.txt
+RUN pip3 install --no-cache-dir -r /app/server/requirements.txt \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-VOLUME /etc/nginx/conf.d
-COPY ./nginx.conf /etc/nginx/conf.d/default.conf
+# 复制 Flask 后端
+COPY ./server/app.py /root/app/server/app.py
 
-WORKDIR /app
+# 创建 bin 存储目录
+RUN mkdir -p /root/app/server/bin
 
-EXPOSE 80
-CMD ["nginx", "-g", "daemon off;"]
+WORKDIR /root/app/server
+
+# 挂载 bin 目录（持久化 bin 文件，防止容器重建后丢失）
+VOLUME /root/app/server/bin
+
+EXPOSE 5001
+CMD ["python3", "app.py"]

@@ -15,12 +15,18 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted } from "vue";
+import { computed, onMounted, onUnmounted, watch } from "vue";
 import { darkTheme } from "naive-ui";
 import { useTheme } from "@/composables/useTheme";
+import { useLocalFileSync } from "@/composables/useLocalFileSync";
+import { useTokenStore } from "@/stores/tokenStore";
+import { useRouter } from "vue-router";
 
 const { isDark, initTheme, setupSystemThemeListener, updateReactiveState } =
   useTheme();
+const fileSync = useLocalFileSync();
+const tokenStore = useTokenStore();
+const router = useRouter();
 
 // Naive UI 主题
 const naiveTheme = computed(() => {
@@ -37,7 +43,7 @@ const handleThemeChange = () => {
   }, 50);
 };
 
-onMounted(() => {
+onMounted(async () => {
   initTheme();
   setupSystemThemeListener();
 
@@ -46,6 +52,9 @@ onMounted(() => {
 
   // 初始化时更新状态
   updateReactiveState();
+
+  // 全局初始化本地文件同步句柄（从 IndexedDB 恢复已绑定的文件）
+  await fileSync.init();
 });
 
 onUnmounted(() => {

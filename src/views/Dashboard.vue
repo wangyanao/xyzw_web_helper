@@ -57,6 +57,8 @@ import { ref, computed, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import { useMessage } from "naive-ui";
 import { useTokenStore } from "@/stores/tokenStore";
+import { useLocalFileSync } from "@/composables/useLocalFileSync";
+import { syncBinsFromServer } from "@/composables/useServerBinSync";
 import {
   PersonCircle,
   Cube,
@@ -71,6 +73,7 @@ import {
 const router = useRouter();
 const message = useMessage();
 const tokenStore = useTokenStore();
+const fileSync = useLocalFileSync();
 
 // 响应式数据
 // const recentActivities = ref([]);
@@ -191,6 +194,40 @@ const formatTime = (timestamp) => {
 onMounted(async () => {
   // 确保有Token
   if (!tokenStore.hasTokens) {
+    // 第1步：尝试从本地绑定文件恢复（App.vue 已全局初始化 fileSync）
+    if (fileSync.isLinked.value) {
+      const data = await fileSync.loadFromLinkedFile();
+      if (data) {
+        const result = tokenStore.importTokens(data);
+        if (result.success) {
+          message.success(`已从本地文件恢复 ${data.tokens?.length || 0} 个 Token`);
+          tokenStore.initTokenStore();
+          return;
+        }
+      }
+    }
+
+    // 第2步：尝试从服务器 bin 文件自动恢复（新浏览器/清缓存场景）
+    message.loading('正在从服务器恢复 bin 文件...', { duration: 0, key: 'server-bin-sync' });
+    try {
+      const recovered = await syncBinsFromServer();
+      if (recovered.length > 0) {
+        for (const tokenData of recovered) {
+          const existing = tokenStore.gameTokens.find(t => t.id === tokenData.id);
+          if (!existing) {
+            tokenStore.addToken(tokenData);
+          }
+        }
+        message.destroyAll();
+        message.success(`已从服务器自动恢复 ${recovered.length} 个 Token`);
+        tokenStore.initTokenStore();
+        return;
+      }
+    } catch (e) {
+      console.warn('[serverBinSync] 自动恢复失败', e);
+    }
+    message.destroyAll();
+
     router.push("/tokens");
     return;
   }

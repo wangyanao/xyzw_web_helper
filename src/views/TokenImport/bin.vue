@@ -63,6 +63,7 @@
 <script lang="ts" setup>
 import { ref, reactive } from "vue";
 import { useTokenStore } from "@/stores/tokenStore";
+import { useLocalFileSync } from "@/composables/useLocalFileSync";
 import { CloudUpload } from "@vicons/ionicons5";
 
 import {
@@ -95,6 +96,7 @@ const removeRole = (index: number) => {
 };
 
 const tokenStore = useTokenStore();
+const fileSync = useLocalFileSync();
 const message = useMessage();
 const isImporting = ref(false);
 const importForm = reactive({
@@ -318,6 +320,12 @@ const handleImport = async () => {
   });
   console.log("当前Token列表:", tokenStore.gameTokens);
   message.success("Token添加成功");
+
+  // 若已绑定本地文件，立即同步保存
+  if (fileSync.isLinked.value) {
+    await fileSync.saveToLinkedFile(tokenStore.gameTokens);
+  }
+
   roleList.value = [];
   $emit("ok");
 };

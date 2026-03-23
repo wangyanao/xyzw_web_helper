@@ -187,6 +187,11 @@ export default defineConfig(async () => {
             Referer: "https://open.weixin.qq.com/",
           },
         },
+        // 本地 Flask bin 存储服务代理（开发环境）
+        "/api/bin": {
+          target: "http://127.0.0.1:5001",
+          changeOrigin: false,
+        },
       },
     },
     css: {

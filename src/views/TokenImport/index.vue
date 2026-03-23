@@ -110,6 +110,36 @@
             </n-button-group>
           </n-space>
           <div class="header-actions">
+            <!-- 本地文件同步状态 -->
+            <n-tooltip v-if="fileSync.isSupported.value" placement="bottom">
+              <template #trigger>
+                <n-button
+                  size="small"
+                  :type="fileSync.isLinked.value ? 'success' : 'default'"
+                  :loading="fileSync.isSyncing.value"
+                  @click="handleFileSyncClick"
+                  class="file-sync-btn"
+                >
+                  <template #icon>
+                    <n-icon>
+                      <SyncCircle />
+                    </n-icon>
+                  </template>
+                  <span v-if="fileSync.isLinked.value">
+                    {{ fileSync.linkedFileName.value }}
+                  </span>
+                  <span v-else>本地文件</span>
+                </n-button>
+              </template>
+              <div v-if="fileSync.isLinked.value">
+                <div>已绑定: {{ fileSync.linkedFileName.value }}</div>
+                <div v-if="fileSync.lastSyncTimeText.value">上次保存: {{ fileSync.lastSyncTimeText.value }}</div>
+                <div v-if="fileSync.syncError.value" style="color:#ff7875">{{ fileSync.syncError.value }}</div>
+                <div style="margin-top:4px;color:#aaa;font-size:12px">点击管理文件绑定</div>
+              </div>
+              <div v-else>点击绑定本地文件，Token 变更时自动保存</div>
+            </n-tooltip>
+
             <n-button type="success" @click="goToDashboard">
               <template #icon>
                 <n-icon>
@@ -629,6 +659,8 @@ import { h, onMounted, reactive, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import { transformToken } from "@/utils/token";
 import useIndexedDB from "@/hooks/useIndexedDB";
+import { useLocalFileSync } from "@/composables/useLocalFileSync";
+import { syncBinsFromServer } from "@/composables/useServerBinSync";
 const { getArrayBuffer, storeArrayBuffer, deleteArrayBuffer, clearAll } = useIndexedDB();
 // 接收路由参数
 const props = defineProps({
@@ -644,6 +676,84 @@ const router = useRouter();
 const message = useMessage();
 const dialog = useDialog();
 const tokenStore = useTokenStore();
+
+// ============================================================
+// 本地文件同步
+// ============================================================
+const fileSync = useLocalFileSync();
+
+// 处理文件同步按钮点击
+const handleFileSyncClick = () => {
+  if (fileSync.isLinked.value) {
+    // 已绑定 - 弹出管理菜单
+    dialog.create({
+      title: '本地文件同步管理',
+      content: `当前绑定文件: ${fileSync.linkedFileName.value}\n上次保存: ${fileSync.lastSyncTimeText.value || '未同步'}`,
+      positiveText: '立即保存',
+      negativeText: '解除绑定',
+      onPositiveClick: async () => {
+        const ok = await fileSync.saveToLinkedFile(tokenStore.gameTokens);
+        ok ? message.success('已保存到本地文件') : message.error(fileSync.syncError.value || '保存失败');
+      },
+      onNegativeClick: async () => {
+        await fileSync.unlinkFile();
+        message.info('已解除本地文件绑定');
+      },
+    });
+  } else {
+    // 未绑定 - 弹出选择菜单
+    dialog.create({
+      title: '绑定本地文件',
+      content: '绑定后，Token 数据将在每次变更时自动保存到本地文件，重新打开时可从该文件加载。',
+      positiveText: '新建备份文件',
+      negativeText: '选择已有文件',
+      onPositiveClick: async () => {
+        const ok = await fileSync.linkFile();
+        if (ok) {
+          // 立即保存当前数据
+          await fileSync.saveToLinkedFile(tokenStore.gameTokens);
+          message.success(`已绑定并保存到 ${fileSync.linkedFileName.value}`);
+        }
+      },
+      onNegativeClick: async () => {
+        const ok = await fileSync.openAndLinkFile();
+        if (ok) {
+          message.success(`已绑定文件 ${fileSync.linkedFileName.value}`);
+          // 提示是否从该文件加载
+          dialog.info({
+            title: '从文件加载Token？',
+            content: '是否从绑定的文件加载 Token？（会覆盖当前列表）',
+            positiveText: '加载',
+            negativeText: '跳过',
+            onPositiveClick: async () => {
+              const data = await fileSync.loadFromLinkedFile();
+              if (data) {
+                const result = tokenStore.importTokens(data);
+                result.success ? message.success(result.message) : message.error(result.message);
+              } else {
+                message.error(fileSync.syncError.value || '读取文件失败');
+              }
+            },
+          });
+        }
+      },
+    });
+  }
+};
+
+// Token 变更时自动保存到本地文件（防抖 2 秒）
+let autoSaveTimer = null;
+watch(
+  () => tokenStore.gameTokens,
+  (tokens) => {
+    if (!fileSync.isLinked.value || tokens.length === 0) return;
+    if (autoSaveTimer) clearTimeout(autoSaveTimer);
+    autoSaveTimer = setTimeout(async () => {
+      await fileSync.saveToLinkedFile(tokens);
+    }, 2000);
+  },
+  { deep: true },
+);
 
 // 响应式数据
 const showImportForm = ref(false);
@@ -795,15 +905,20 @@ const editRules = {
   token: [{ required: true, message: "请输入Token字符串", trigger: "blur" }],
 };
 
-const bulkOptions = [
+const bulkOptions = computed(() => [
   { label: "刷新所有Token", key: "refreshAll" },
   { label: "更新token信息", key: "updateInfo" },
   { label: "导出所有Token", key: "export" },
   { label: "导入Token文件", key: "import" },
+  fileSync.isSupported.value
+    ? fileSync.isLinked.value
+      ? { label: `从文件加载 (${fileSync.linkedFileName.value})`, key: "loadFromFile" }
+      : { label: "从本地文件加载", key: "loadFromFile" }
+    : null,
   { label: "清理过期Token", key: "clean" },
   { label: "断开所有连接", key: "disconnect" },
   { label: "清除所有Token", key: "clear" },
-];
+].filter(Boolean));
 
 /**
  * 手动打开Token管理卡片
@@ -1308,6 +1423,9 @@ const handleBulkAction = (key) => {
     case "import":
       importTokenFile();
       break;
+    case "loadFromFile":
+      loadTokensFromFile();
+      break;
     case "clean":
       cleanExpiredTokens();
       break;
@@ -1317,6 +1435,54 @@ const handleBulkAction = (key) => {
     case "clear":
       clearAllTokens();
       break;
+  }
+};
+
+// 从本地文件加载 Token
+const loadTokensFromFile = async () => {
+  if (!fileSync.isSupported.value) {
+    // 降级：使用传统文件选择
+    importTokenFile();
+    return;
+  }
+
+  let data = null;
+
+  if (fileSync.isLinked.value) {
+    // 已绑定文件，直接读取
+    data = await fileSync.loadFromLinkedFile();
+    if (!data) {
+      message.error(fileSync.syncError.value || '读取文件失败');
+      return;
+    }
+  } else {
+    // 未绑定，弹出选择文件对话框
+    data = await fileSync.openAndLoadFile();
+    if (!data) return;
+  }
+
+  // 询问合并还是覆盖
+  if (tokenStore.hasTokens) {
+    dialog.warning({
+      title: '加载方式',
+      content: `文件中有 ${data.tokens?.length || 0} 个 Token，当前已有 ${tokenStore.gameTokens.length} 个，如何处理？`,
+      positiveText: '合并（保留现有）',
+      negativeText: '覆盖（替换全部）',
+      onPositiveClick: () => {
+        // 合并：只添加新的
+        const existingIds = new Set(tokenStore.gameTokens.map((t) => t.id));
+        const newTokens = (data.tokens || []).filter((t) => !existingIds.has(t.id));
+        newTokens.forEach((t) => tokenStore.addToken(t));
+        message.success(`已合并 ${newTokens.length} 个新 Token`);
+      },
+      onNegativeClick: () => {
+        const result = tokenStore.importTokens(data);
+        result.success ? message.success(result.message) : message.error(result.message);
+      },
+    });
+  } else {
+    const result = tokenStore.importTokens(data);
+    result.success ? message.success(result.message) : message.error(result.message);
   }
 };
 
@@ -1585,6 +1751,40 @@ watch(() => [props.token, props.api], handleUrlParams, { immediate: false });
 // 生命周期
 onMounted(async () => {
   tokenStore.initTokenStore();
+
+  // 初始化本地文件同步（从 IndexedDB 读取已绑定的文件句柄）
+  await fileSync.init();
+
+  // 若已绑定本地文件且当前没有 Token，自动加载
+  if (fileSync.isLinked.value && !tokenStore.hasTokens) {
+    const data = await fileSync.loadFromLinkedFile();
+    if (data) {
+      const result = tokenStore.importTokens(data);
+      if (result.success) {
+        message.success(`已从本地文件加载 ${data.tokens?.length || 0} 个 Token`);
+      }
+    }
+  }
+
+  // 若仍然没有 Token，尝试从服务器 bin 文件自动恢复（新浏览器/清缓存场景）
+  if (!tokenStore.hasTokens) {
+    const loadingMsg = message.loading('正在从服务器恢复 bin 文件...', { duration: 0 });
+    try {
+      const recovered = await syncBinsFromServer();
+      if (recovered.length > 0) {
+        for (const tokenData of recovered) {
+          const existing = tokenStore.gameTokens.find(t => t.id === tokenData.id);
+          if (!existing) tokenStore.addToken(tokenData);
+        }
+        message.success(`已从服务器自动恢复 ${recovered.length} 个 Token`);
+        showImportForm.value = false;
+      }
+    } catch (e) {
+      console.warn('[serverBinSync] 自动恢复失败', e);
+    } finally {
+      loadingMsg.destroy();
+    }
+  }
 
   // 处理URL参数
   await handleUrlParams();

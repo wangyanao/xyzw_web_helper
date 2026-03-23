@@ -77,5 +77,6 @@ temp/
 node_modules/
 dist.zip
 *.bin
+*.tar
 bin/
 server/config.json

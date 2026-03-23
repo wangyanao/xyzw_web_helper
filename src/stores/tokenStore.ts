@@ -1164,34 +1164,18 @@ export const useTokenStore = defineStore("tokens", () => {
   };
 
   const cleanExpiredTokens = async () => {
-    const now = new Date();
-    const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    // ✅ 禁用自动过期删除逻辑（修复 Token 一天过期问题）
+    // 
+    // 原问题：手动导入的 Token 在 24 小时后被自动删除
+    // 原因：cleanExpiredTokens 对 manual 类型 Token 执行过期检查
+    // 修复：所有导入方式的 Token（manual/url/bin/wxQrcode）都长期有效
+    //
+    // 说明：Token 只在用户显式点击删除按钮时才会被移除
+    //
+    // 如果未来需要实现真正的过期机制（如从游戏服务器验证 Token 有效性），
+    // 应该在 WebSocket 连接或 API 调用时进行，而不是基于本地时间戳
     
-    // 找出需要清理的token
-    const tokensToRemove = gameTokens.value.filter((token) => {
-      // URL和bin文件导入的token设为长期有效，不会过期
-      // 升级为长期有效的token也不会过期
-      if (
-        token.importMethod === "url" ||
-        token.importMethod === "bin" ||
-        token.importMethod === "wxQrcode" ||
-        token.upgradedToPermanent
-      ) {
-        return false;
-      }
-      // 手动导入的token按原逻辑处理（24小时过期）
-      const lastUsed = new Date(token.lastUsed || token.createdAt);
-      return lastUsed <= oneDayAgo;
-    });
-
-    const cleanedCount = tokensToRemove.length;
-    
-    // 逐个删除，触发清理逻辑（WebSocket断开、IndexedDB删除等）
-    for (const token of tokensToRemove) {
-      await removeToken(token.id);
-    }
-    
-    return cleanedCount;
+    return 0;  // 不删除任何 Token
   };
 
   // 将现有token升级为长期有效

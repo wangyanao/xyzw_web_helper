@@ -108,8 +108,10 @@ import { getTokenId, transformToken, getServerList } from "@/utils/token";
 import useIndexedDB from "@/hooks/useIndexedDB";
 import { g_utils } from "@/utils/bonProtocol";
 import { useTokenStore } from "@/stores/tokenStore";
+import { useLocalFileSync } from "@/composables/useLocalFileSync";
 const tokenStore = useTokenStore();
 const { storeArrayBuffer } = useIndexedDB();
+const fileSync = useLocalFileSync();
 
 const message = useMessage();
 const isImporting = ref(false);
@@ -243,6 +245,7 @@ const addSelectedRole = async (roleInfo: any) => {
       roleIndex: roleIndex,
       wsUrl: importForm.wsUrl || "",
       importMethod: "wxQrcode",
+      _binBuffer: newBinBuffer,  // 保存原始 bin 于内存，用于点击“添加Token”时自动下载
     });
 
     message.success(`已添加角色: ${finalName}`);
@@ -699,12 +702,40 @@ const handleImport = async () => {
     message.error("请先上传bin文件！");
     return;
   }
+
+  // 上传 bin 文件到服务器（优先），同时触发浏览器本地下载作为备份
+  const uploadResults = await Promise.allSettled(
+    roleList.value
+      .filter((role) => role._binBuffer)
+      .map((role) => {
+        const fileName = `xyzw-${role.server}-${role.name}.bin`;
+        return uploadBinToServer(fileName, role._binBuffer);
+      })
+  );
+
+  const serverSaved = uploadResults.filter((r) => r.status === 'fulfilled' && r.value).length;
+  const total = uploadResults.length;
+
+  if (total > 0) {
+    if (serverSaved === total) {
+      message.success(`已将 ${serverSaved} 个 bin 文件保存到服务器`);
+    } else {
+      // 服务器上传失败，降级为浏览器本地下载
+      message.warning(`服务器上传失败，改为下载到本地 (${total - serverSaved}/${total} 失败)`);
+      for (const role of roleList.value) {
+        if (role._binBuffer) {
+          const fileName = `xyzw-${role.server}-${role.name}.bin`;
+          downloadBinFile(fileName, role._binBuffer);
+        }
+      }
+    }
+  }
+
   roleList.value.forEach((role) => {
     // tokenStore.gameTokens中发现已存在的重复名称，则移出token后重新添加
     const gameToken = tokenStore.gameTokens.find((t) => t.id === role.id);
     if (gameToken) {
       console.log("移除同名token:", gameToken);
-      // tokenStore.removeToken(gameToken.id);
       tokenStore.updateToken(gameToken.id, {
         ...role,
       });
@@ -716,8 +747,40 @@ const handleImport = async () => {
   });
   console.log("当前Token列表:", tokenStore.gameTokens);
   message.success("Token添加成功");
+
+  // 若已绑定本地文件，立即同步保存
+  if (fileSync.isLinked.value) {
+    const ok = await fileSync.saveToLinkedFile(tokenStore.gameTokens);
+    if (ok) {
+      message.success(`已自动同步到本地文件: ${fileSync.linkedFileName.value}`);
+    }
+  }
+
   roleList.value = [];
   emit("ok");
+};
+
+/**
+ * 把 bin 文件上传到服务器的 /api/bin/upload 接口
+ * 返回 true 表示成功
+ */
+const uploadBinToServer = async (fileName: string, binBuffer: ArrayBuffer): Promise<boolean> => {
+  try {
+    const resp = await fetch(`/api/bin/upload?filename=${encodeURIComponent(fileName)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: binBuffer,
+    });
+    if (!resp.ok) {
+      console.warn(`[bin upload] 上传失败 ${fileName}: HTTP ${resp.status}`);
+      return false;
+    }
+    const json = await resp.json();
+    return json.success === true;
+  } catch (e) {
+    console.warn(`[bin upload] 上传异常 ${fileName}:`, e);
+    return false;
+  }
 };
 
 const downloadBinFile = (fileName, bin) => {
