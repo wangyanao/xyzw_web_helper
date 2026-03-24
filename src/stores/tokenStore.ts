@@ -198,6 +198,19 @@ export const useTokenStore = defineStore("tokens", () => {
     }
   };
 
+  // 同步 token 数据到服务端（供服务端定时任务使用）
+  const syncTokensToServer = () => {
+    const tokenMap: Record<string, { id: string; name: string; token: string; server: string; importMethod: string }> = {};
+    for (const t of gameTokens.value) {
+      tokenMap[t.id] = { id: t.id, name: t.name, token: t.token, server: t.server || '', importMethod: t.importMethod || 'manual' };
+    }
+    fetch('/api/tokens/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(tokenMap),
+    }).catch(() => { /* 服务端不可用时静默忽略 */ });
+  };
+
   // Token管理
   const addToken = (tokenData: TokenData) => {
     let id = tokenData.id || `token_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -220,6 +233,7 @@ export const useTokenStore = defineStore("tokens", () => {
     };
 
     gameTokens.value.push(newToken);
+    syncTokensToServer();
     return newToken;
   };
 
@@ -252,6 +266,7 @@ export const useTokenStore = defineStore("tokens", () => {
     // 同时删除IndexedDB中的数据
     await deleteArrayBuffer(tokenId);
 
+    syncTokensToServer();
     return true;
   };
 
@@ -718,9 +733,26 @@ export const useTokenStore = defineStore("tokens", () => {
           throw new Error(`Token无效: ${parseResult.error}`);
         }
       }
-      // 6. 构建WebSocket URL
+      // 6. 刷新 sessId/connId（每次连接都生成新值，避免备份 JSON 中旧 session 被服务器拒绝）
+      try {
+        const tokenObj = JSON.parse(actualToken);
+        if (tokenObj.sessId !== undefined || tokenObj.connId !== undefined) {
+          const now = Date.now();
+          tokenObj.sessId = now * 100 + Math.floor(Math.random() * 100);
+          tokenObj.connId = now + Math.floor(Math.random() * 10);
+          tokenObj.isRestore = 0;
+          actualToken = JSON.stringify(tokenObj);
+          // 同步更新存储，避免下次重连还用旧 session
+          updateToken(tokenId, { token: actualToken });
+        }
+      } catch {
+        // 非 JSON token（纯 roleToken 字符串），无需处理
+      }
+
+      // 7. 构建WebSocket URL
       const baseWsUrl = `wss://xxz-xyzw.hortorgames.com/agent?p=${encodeURIComponent(actualToken)}&e=x&lang=chinese`;
 
+      // 旧注释已合并到步骤6
       const wsUrl = customWsUrl || baseWsUrl;
 
       wsLogger.debug(
@@ -1138,6 +1170,27 @@ export const useTokenStore = defineStore("tokens", () => {
     try {
       if (data.tokens && Array.isArray(data.tokens)) {
         gameTokens.value = data.tokens;
+
+        // bin/wxQrcode 类型 token 的 roleToken 已过期，需要调用方先刷新 session 再连接
+        // 非 bin 类型可以立即自动连接
+        const hasBinTokens = data.tokens.some(
+          (t: any) => t.importMethod === 'bin' || t.importMethod === 'wxQrcode'
+        );
+
+        if (!hasBinTokens) {
+          const targetId = (
+            selectedTokenId.value &&
+            data.tokens.find((t: any) => t.id === selectedTokenId.value)
+          )
+            ? selectedTokenId.value
+            : data.tokens[0]?.id;
+
+          if (targetId) {
+            setTimeout(() => selectToken(targetId, true), 50);
+          }
+        }
+        // bin 类型：由 refreshBinTokensAfterImport 刷新 session 后再触发连接
+
         return {
           success: true,
           message: `成功导入 ${data.tokens.length} 个Token`,
@@ -1596,6 +1649,7 @@ export const useTokenStore = defineStore("tokens", () => {
     getGroupTokenIds,
     getValidGroupTokenIds,
     cleanupInvalidTokens,
+    syncTokensToServer,
 
     // 开发者工具
     devTools: {

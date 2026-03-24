@@ -1,0 +1,12 @@
+{
+  "name": "xyzw-server",
+  "version": "1.0.0",
+  "description": "XYZW game server-side task runner",
+  "type": "module",
+  "scripts": {
+    "run-task": "node run_task.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

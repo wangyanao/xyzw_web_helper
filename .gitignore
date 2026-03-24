@@ -70,7 +70,7 @@ jspm_packages/
 # Temporary folders
 tmp/
 temp/
-
+docker/nginx.conf
 .github
 *.bat
 *.exe

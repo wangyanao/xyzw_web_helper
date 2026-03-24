@@ -192,6 +192,19 @@ export default defineConfig(async () => {
           target: "http://127.0.0.1:5001",
           changeOrigin: false,
         },
+        // 本地 Flask 定时任务 & token 同步代理（开发环境）
+        "/api/tasks": {
+          target: "http://127.0.0.1:5001",
+          changeOrigin: false,
+        },
+        "/api/tokens": {
+          target: "http://127.0.0.1:5001",
+          changeOrigin: false,
+        },
+        "/api/scheduler": {
+          target: "http://127.0.0.1:5001",
+          changeOrigin: false,
+        },
       },
     },
     css: {

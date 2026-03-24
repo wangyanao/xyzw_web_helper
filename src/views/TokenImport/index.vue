@@ -1438,6 +1438,33 @@ const handleBulkAction = (key) => {
   }
 };
 
+// 导入 bin 类型 token 后，从服务器刷新过期的 session，刷新完成后再触发连接
+const refreshBinTokensAfterImport = async (importedTokens) => {
+  const hasBin = importedTokens.some(t => t.importMethod === 'bin' || t.importMethod === 'wxQrcode');
+  if (!hasBin) return;
+  const loading = message.loading('正在从服务器刷新 bin Token session...', { duration: 0 });
+  let updated = 0;
+  try {
+    const recovered = await syncBinsFromServer();
+    for (const r of recovered) {
+      if (tokenStore.gameTokens.find(t => t.id === r.id)) {
+        tokenStore.updateToken(r.id, { token: r.token });
+        updated++;
+      }
+    }
+    if (updated > 0) message.success(`已刷新 ${updated} 个 bin Token 的 session`);
+    else message.warning('未能从服务器获取 bin 文件，请确认服务器已启动且已上传 bin 文件');
+  } catch (e) {
+    console.warn('[serverBinSync] 刷新失败', e);
+    message.warning('bin Token session 刷新失败，连接可能不稳定');
+  } finally {
+    loading.destroy();
+    // 无论刷新是否成功，都触发连接（成功则用新 token，失败则让 attemptTokenRefresh 处理）
+    const targetId = tokenStore.selectedToken?.id || importedTokens[0]?.id;
+    if (targetId) tokenStore.selectToken(targetId, true);
+  }
+};
+
 // 从本地文件加载 Token
 const loadTokensFromFile = async () => {
   if (!fileSync.isSupported.value) {
@@ -1468,21 +1495,24 @@ const loadTokensFromFile = async () => {
       content: `文件中有 ${data.tokens?.length || 0} 个 Token，当前已有 ${tokenStore.gameTokens.length} 个，如何处理？`,
       positiveText: '合并（保留现有）',
       negativeText: '覆盖（替换全部）',
-      onPositiveClick: () => {
+      onPositiveClick: async () => {
         // 合并：只添加新的
         const existingIds = new Set(tokenStore.gameTokens.map((t) => t.id));
         const newTokens = (data.tokens || []).filter((t) => !existingIds.has(t.id));
         newTokens.forEach((t) => tokenStore.addToken(t));
         message.success(`已合并 ${newTokens.length} 个新 Token`);
+        await refreshBinTokensAfterImport(data.tokens || []);
       },
-      onNegativeClick: () => {
+      onNegativeClick: async () => {
         const result = tokenStore.importTokens(data);
         result.success ? message.success(result.message) : message.error(result.message);
+        if (result.success) await refreshBinTokensAfterImport(data.tokens || []);
       },
     });
   } else {
     const result = tokenStore.importTokens(data);
     result.success ? message.success(result.message) : message.error(result.message);
+    if (result.success) await refreshBinTokensAfterImport(data.tokens || []);
   }
 };
 
@@ -1511,12 +1541,13 @@ const importTokenFile = () => {
     const file = e.target.files[0];
     if (file) {
       const reader = new FileReader();
-      reader.onload = (e) => {
+      reader.onload = async (e) => {
         try {
           const data = JSON.parse(e.target.result);
           const result = tokenStore.importTokens(data);
           if (result.success) {
             message.success(result.message);
+            await refreshBinTokensAfterImport(data.tokens || []);
           } else {
             message.error(result.message);
           }

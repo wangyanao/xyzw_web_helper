@@ -3022,6 +3022,26 @@ const saveScheduledTasks = () => {
   } catch (error) {
     console.error("Failed to save scheduled tasks:", error);
   }
+  // 同步到服务端定时调度器（静默失败）
+  syncTasksToServer(scheduledTasks.value);
+};
+
+// 将定时任务同步到服务端 APScheduler
+const syncTasksToServer = async (tasks) => {
+  try {
+    // 每个任务附带当前 batchSettings（服务端执行时需要 dreamPurchaseList 等配置）
+    const tasksWithSettings = tasks.map(t => ({ ...t, batchSettings: { ...batchSettings } }));
+    const res = await fetch("/api/tasks/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(tasksWithSettings),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    console.debug("[scheduler] 服务端任务同步成功，共", tasks.length, "条");
+  } catch (e) {
+    // 服务端不可用时静默忽略
+    console.debug("[scheduler] 服务端任务同步失败（服务未启动？）", e.message);
+  }
 };
 
 // Open task modal for adding new task
@@ -3685,6 +3705,9 @@ onMounted(() => {
   // Start countdown timer
   startCountdown();
   loadTaskTemplates();
+  // 页面加载时将本地 token 和任务同步到服务端定时调度器
+  tokenStore.syncTokensToServer();
+  syncTasksToServer(scheduledTasks.value);
 });
 
 // Cleanup countdown interval on unmount

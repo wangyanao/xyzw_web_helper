@@ -1,20 +1,32 @@
 FROM python:3.11-slim
 
+# 安装 Node.js（用于执行定时任务脚本）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    nodejs npm \
+    && rm -rf /var/lib/apt/lists/*
+
 # 安装 Python 依赖
 COPY ./server/requirements.txt /app/server/requirements.txt
 RUN pip3 install --no-cache-dir -r /app/server/requirements.txt \
     -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# 复制 Flask 后端
+# 复制 Flask 后端 + Node.js 任务脚本
 COPY ./server/app.py /root/app/server/app.py
+COPY ./server/gameClient.js /root/app/server/gameClient.js
+COPY ./server/run_task.js /root/app/server/run_task.js
+COPY ./server/package.json /root/app/server/package.json
+
+# 安装 Node.js 依赖（ws 包）
+WORKDIR /root/app/server
+RUN npm install --omit=dev
 
 # 创建 bin 存储目录
-RUN mkdir -p /root/app/server/bin
+RUN mkdir -p /root/app/server/bin /root/app/server/data
 
-WORKDIR /root/app/server
-
-# 挂载 bin 目录（持久化 bin 文件，防止容器重建后丢失）
+# 挂载目录（持久化存储，防止容器重建后丢失）
+# bin: 存放 bin 文件；data: 存放 tasks.json / tokens.json
 VOLUME /root/app/server/bin
+VOLUME /root/app/server/data
 
 EXPOSE 5001
 CMD ["python3", "app.py"]
