@@ -3026,6 +3026,35 @@ const saveScheduledTasks = () => {
   syncTasksToServer(scheduledTasks.value);
 };
 
+// 从服务器拉取任务，合并到本地（服务器有而本地没有的追加进来）
+const pullTasksFromServer = async () => {
+  try {
+    const res = await fetch("/api/tasks");
+    if (!res.ok) return;
+    const serverTasks = await res.json();
+    if (!Array.isArray(serverTasks) || serverTasks.length === 0) return;
+    const localIds = new Set(scheduledTasks.value.map((t) => t.id));
+    const newTasks = serverTasks.filter((t) => !localIds.has(t.id));
+    if (newTasks.length > 0) {
+      scheduledTasks.value.push(...newTasks);
+      saveScheduledTasksLocal(); // 只写本地存储，不推送到服务器
+      console.debug("[scheduler] 从服务器补充了", newTasks.length, "个任务");
+    }
+  } catch (e) {
+    console.debug("[scheduler] 从服务器拉取任务失败", e.message);
+  }
+};
+
+// 只写本地 localStorage，不触发服务器同步
+const saveScheduledTasksLocal = () => {
+  try {
+    const dataToSave = JSON.stringify(scheduledTasks.value);
+    localStorage.setItem("scheduledTasks", dataToSave);
+  } catch (error) {
+    console.error("Failed to save scheduled tasks locally:", error);
+  }
+};
+
 // 将定时任务同步到服务端 APScheduler
 const syncTasksToServer = async (tasks) => {
   try {
@@ -3698,15 +3727,16 @@ const startScheduler = () => {
 };
 
 // Debug: Log initial state when component mounts
-onMounted(() => {
+onMounted(async () => {
   // Start the task scheduler after all functions are initialized
   scheduleTaskExecution();
   // Start countdown timer
   startCountdown();
   loadTaskTemplates();
-  // 页面加载时将本地 token 和任务同步到服务端定时调度器
+  // 页面加载时将本地 token 同步到服务端
   tokenStore.syncTokensToServer();
-  syncTasksToServer(scheduledTasks.value);
+  // 从服务器拉取任务并合并到本地（避免新浏览器空列表覆盖服务器已有任务）
+  await pullTasksFromServer();
 });
 
 // Cleanup countdown interval on unmount
