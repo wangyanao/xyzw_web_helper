@@ -3153,14 +3153,13 @@ const saveTask = () => {
   }
 
   // Format runTime as string for storage
+  // getHours()/getMinutes() 返回本地时区时间，比 toLocaleTimeString 更可靠
   let formattedRunTime = null;
-  if (taskForm.runType === "daily" && taskForm.runTime) {
+  if (taskForm.runType === "daily" && taskForm.runTime != null) {
     const time = new Date(taskForm.runTime);
-    formattedRunTime = time.toLocaleTimeString("zh-CN", {
-      hour12: false,
-      hour: "2-digit",
-      minute: "2-digit",
-    });
+    const h = time.getHours().toString().padStart(2, "0");
+    const m = time.getMinutes().toString().padStart(2, "0");
+    formattedRunTime = `${h}:${m}`;
   }
 
   const taskData = {

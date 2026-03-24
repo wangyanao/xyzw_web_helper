@@ -12,6 +12,7 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED, EVENT_JOB_MISSED
 
 app = Flask(__name__)
 CORS(app)
@@ -30,7 +31,22 @@ os.makedirs(DATA_DIR, exist_ok=True)
 UPLOAD_SECRET = os.environ.get('UPLOAD_SECRET', '')
 
 # ===== APScheduler =====
-scheduler = BackgroundScheduler(timezone='Asia/Shanghai')
+scheduler = BackgroundScheduler(
+    timezone='Asia/Shanghai',
+    job_defaults={
+        'misfire_grace_time': 3600,  # 允许最多1小时内补发（防容器重启/延迟导致错过）
+        'coalesce': True,            # 错过多次只补发一次
+    }
+)
+
+def _job_event_listener(event):
+    if hasattr(event, 'exception') and event.exception:
+        print(f'[scheduler] ❌ 任务执行出错: {event.job_id} → {event.exception}', flush=True)
+    elif hasattr(event, 'scheduled_run_time'):
+        # MISSED event
+        print(f'[scheduler] ⚠️  任务错过执行: {event.job_id}, 计划时间: {event.scheduled_run_time}', flush=True)
+
+scheduler.add_listener(_job_event_listener, EVENT_JOB_ERROR | EVENT_JOB_MISSED)
 
 
 def check_secret():
@@ -188,8 +204,8 @@ def _fire_task(task_id):
         print(f'[scheduler] 任务 {task["name"]} 已禁用，跳过')
         return
 
-    print(f'[scheduler] {datetime.now()} 触发任务: {task["name"]}')
-    print(f'[scheduler] tokens 路径: {TOKENS_FILE}, tasks 路径: {TASKS_FILE}')
+    print(f'[scheduler] {datetime.now()} 触发任务: {task["name"]}', flush=True)
+    print(f'[scheduler] tokens 路径: {TOKENS_FILE}, tasks 路径: {TASKS_FILE}', flush=True)
     try:
         proc = subprocess.Popen(
             ['node', RUN_TASK_JS],
@@ -226,7 +242,7 @@ def _add_job(task):
         h, m = run_time.split(':')
         scheduler.add_job(
             _fire_task,
-            CronTrigger(hour=int(h), minute=int(m)),
+            CronTrigger(hour=int(h), minute=int(m), timezone='Asia/Shanghai'),
             id=job_id,
             args=[task_id],
             replace_existing=True,
@@ -235,12 +251,12 @@ def _add_job(task):
         cron_expr = task.get('cronExpression', '0 8 * * *')
         scheduler.add_job(
             _fire_task,
-            CronTrigger.from_crontab(cron_expr),
+            CronTrigger.from_crontab(cron_expr, timezone='Asia/Shanghai'),
             id=job_id,
             args=[task_id],
             replace_existing=True,
         )
-    print(f'[scheduler] 已注册任务: {task["name"]} ({run_type})')
+    print(f'[scheduler] 已注册任务: {task["name"]} ({run_type})', flush=True)
 
 
 # ===== 定时任务 API =====
@@ -379,6 +395,6 @@ if __name__ == '__main__':
     # 启动定时任务调度器
     _load_and_schedule_all()
     scheduler.start()
-    print(f'[scheduler] APScheduler 已启动')
+    print(f'[scheduler] APScheduler 已启动', flush=True)
 
     app.run(host='0.0.0.0', port=port, debug=False)

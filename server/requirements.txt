@@ -2,4 +2,4 @@ flask
 flask-cors
 requests
 werkzeug
-APScheduler
+APScheduler>=3.10,<4.0

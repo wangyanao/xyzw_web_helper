@@ -1,5 +1,7 @@
+.PHONY: build save send dist send_dist run
+
 # 1. 构建镜像
-version := 1.0.4
+version := 1.0.7
 build:
 	docker build -f docker/dockerfile -t xyzw-bin-server:$(version) .
 
@@ -18,9 +20,10 @@ send_dist:
 
 run:
 	@echo "docker run -d \
-	-p 5001:5001 \
-	-v /root/app/server/bin:/root/app/server/bin \
-	-v /root/app/server/data:/root/app/server/data \
-	--name xyzw-bin-server \
-	--restart unless-stopped \
-	xyzw-bin-server:$(version)"
+  -p 5001:5001 \
+  -e PYTHONUNBUFFERED=1 \
+  -v /root/app/server/bin:/root/app/server/bin \
+  -v /root/app/server/data:/root/app/server/data \
+  --name xyzw-bin-server \
+  --restart unless-stopped \
+  xyzw-bin-server:$(version)"

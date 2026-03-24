@@ -71,6 +71,7 @@ jspm_packages/
 tmp/
 temp/
 docker/nginx.conf
+server/data/
 .github
 *.bat
 *.exe

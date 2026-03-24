@@ -46,7 +46,13 @@ function loadTokens() {
 }
 
 function log(name, msg, level = 'info') {
-  const ts = new Date().toISOString();
+  // 输出本地时间（Asia/Shanghai +8），避免 toISOString() 的 UTC 偏差
+  const ts = new Date().toLocaleString('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: false,
+  }).replace(/\//g, '-');
   console.log(JSON.stringify({ ts, name, msg, level }));
 }
 
