@@ -10,6 +10,7 @@ import uuid
 import hmac
 import hashlib
 import subprocess
+import threading
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from functools import wraps
@@ -50,55 +51,83 @@ SESSION_TTL = int(os.environ.get('SESSION_TTL', 86400))
 # ===== 内存 session 存储（tokenId -> {userId, role, exp}）=====
 _sessions: dict = {}
 
+# ===== 文件操作锁（防止并发读写导致 JSON 损坏）=====
+_users_lock = threading.Lock()
+_tokens_lock = threading.Lock()
+_bin_map_lock = threading.Lock()
+
 
 # ===== 用户数据持久化 =====
 
 DEFAULT_ADMIN_PASSWORD_HASH = hashlib.sha256(b'xyzw@2024').hexdigest()
 
 def load_users() -> dict:
-    """从 users.json 读取用户数据，不存在则初始化默认管理员"""
-    try:
-        if os.path.isfile(USERS_FILE):
-            with open(USERS_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                if isinstance(data, dict) and data:
-                    return data
-    except Exception:
-        pass
-    # 初始化默认 admin
-    default = {
-        'admin': {
-            'id': 'admin',
-            'username': 'admin',
-            'passwordHash': DEFAULT_ADMIN_PASSWORD_HASH,
-            'role': 'admin',
-            'assignedTokenIds': [],
-            'createdAt': now_shanghai().isoformat(),
+    """从 users.json 读取用户数据，不存在则返回默认管理员（不覆盖写入）"""
+    with _users_lock:
+        try:
+            if os.path.isfile(USERS_FILE):
+                with open(USERS_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, dict) and data:
+                        return data
+        except Exception as e:
+            print(f'[users] 读取 users.json 失败: {e}，返回内存默认值（不覆盖文件）')
+            return {
+                'admin': {
+                    'id': 'admin',
+                    'username': 'admin',
+                    'passwordHash': DEFAULT_ADMIN_PASSWORD_HASH,
+                    'role': 'admin',
+                    'assignedTokenIds': [],
+                    'createdAt': now_shanghai().isoformat(),
+                }
+            }
+        # 文件不存在或为空，初始化并写入
+        default = {
+            'admin': {
+                'id': 'admin',
+                'username': 'admin',
+                'passwordHash': DEFAULT_ADMIN_PASSWORD_HASH,
+                'role': 'admin',
+                'assignedTokenIds': [],
+                'createdAt': now_shanghai().isoformat(),
+            }
         }
-    }
-    save_users(default)
-    return default
+        _save_users_unsafe(default)
+        return default
+
+
+def _save_users_unsafe(users: dict):
+    """写入 users.json（调用方须已持有 _users_lock）"""
+    tmp = USERS_FILE + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(users, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, USERS_FILE)  # 原子替换，防止截断
 
 
 def save_users(users: dict):
-    with open(USERS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(users, f, ensure_ascii=False, indent=2)
+    with _users_lock:
+        _save_users_unsafe(users)
 
 
 def load_bin_map() -> dict:
     """filename -> tokenId (MD5) 映射"""
-    try:
-        if os.path.isfile(BIN_MAP_FILE):
-            with open(BIN_MAP_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
+    with _bin_map_lock:
+        try:
+            if os.path.isfile(BIN_MAP_FILE):
+                with open(BIN_MAP_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
 
 
 def save_bin_map(m: dict):
-    with open(BIN_MAP_FILE, 'w', encoding='utf-8') as f:
-        json.dump(m, f, ensure_ascii=False, indent=2)
+    with _bin_map_lock:
+        tmp = BIN_MAP_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(m, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, BIN_MAP_FILE)
 
 
 # ===== Session 工具 =====
@@ -495,17 +524,21 @@ def save_tasks(tasks):
 
 def load_tokens():
     """从 tokens.json 读取 token 映射"""
-    try:
-        with open(TOKENS_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    with _tokens_lock:
+        try:
+            with open(TOKENS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
 
 
 def save_tokens(tokens):
-    """保存 token 映射到 tokens.json"""
-    with open(TOKENS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(tokens, f, ensure_ascii=False, indent=2)
+    """保存 token 映射到 tokens.json（原子写入）"""
+    with _tokens_lock:
+        tmp = TOKENS_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(tokens, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, TOKENS_FILE)
 
 
 def _fire_task(task_id):
@@ -658,20 +691,16 @@ def sync_tokens():
             'importMethod': tdata.get('importMethod', 'manual'),
         }
 
+    # 空列表 = 新浏览器/清缓存，不代表所有 token 已删除，直接跳过避免误清数据
+    if not safe:
+        return jsonify({'success': True, 'count': 0})
+
     save_tokens(safe)
 
-    # 清理 users.json 中已不存在的 tokenId
-    valid_ids = set(safe.keys())
-    users = load_users()
-    changed = False
-    for user in users.values():
-        old = user.get('assignedTokenIds', [])
-        new = [tid for tid in old if tid in valid_ids]
-        if len(new) != len(old):
-            user['assignedTokenIds'] = new
-            changed = True
-    if changed:
-        save_users(users)
+    # 注意：不在此处清理 assignedTokenIds。
+    # sync 请求来自单个浏览器，其 token 列表是该用户的子集，
+    # 用它来裁剪其他用户的 assignedTokenIds 会导致误删。
+    # 清理在管理员查看用户列表时按需进行。
 
     return jsonify({'success': True, 'count': len(safe)})
 

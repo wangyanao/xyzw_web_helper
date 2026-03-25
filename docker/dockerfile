@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 # 安装 Node.js（用于执行定时任务脚本）
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    nodejs npm \
+    nodejs npm vim \
     && rm -rf /var/lib/apt/lists/*
 
 # 安装 Python 依赖
