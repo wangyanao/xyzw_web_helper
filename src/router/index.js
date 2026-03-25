@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 import * as autoRoutes from "vue-router/auto-routes";
 import { useTokenStore } from '@/stores/tokenStore'
 import { isNowInLegionWarTime } from "@/utils/clubBattleUtils"
+import { useUserStore } from '@/stores/userStore'
 
 const generatedRoutes = autoRoutes.routes ?? [];
 
@@ -113,6 +114,12 @@ const my_routes = [
       requiresToken: true
     }
   },
+  {
+    path: '/auth',
+    name: 'PasswordGate',
+    component: () => import('@/views/PasswordGate.vue'),
+    meta: { title: '访问验证' }
+  },
   // 兼容旧路由，重定向到新的token管理页面
   {
     path: '/login',
@@ -156,9 +163,17 @@ autoRoutes.handleHotUpdate?.(router);
 // 导航守卫
 router.beforeEach((to, from, next) => {
   const tokenStore = useTokenStore()
+  const userStore = useUserStore()
 
   // 设置页面标题
   document.title = to.meta.title ? `${to.meta.title} - XYZW 游戏管理系统` : 'XYZW 游戏管理系统'
+
+  // 登录验证：未登录时跳转到登录页
+  if (to.name !== 'PasswordGate' && !userStore.isLoggedIn) {
+    next({ name: 'PasswordGate', query: { redirect: encodeURIComponent(to.fullPath) } })
+    return
+  }
+
   if(to.name==="LegionWar"&&!isNowInLegionWarTime()){
   // if(to.name==="LegionWar"&&isNowInLegionWarTime()){
     next('/admin/dashboard');

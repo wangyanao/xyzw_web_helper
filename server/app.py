@@ -6,13 +6,24 @@ xyzw-web-helper 后端服务
 import os
 import re
 import json
+import uuid
+import hmac
+import hashlib
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from functools import wraps
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED, EVENT_JOB_MISSED
+
+TZ_SHANGHAI = ZoneInfo('Asia/Shanghai')
+
+def now_shanghai():
+    """返回上海时区的当前时间"""
+    return datetime.now(TZ_SHANGHAI)
 
 app = Flask(__name__)
 CORS(app)
@@ -23,12 +34,293 @@ BIN_DIR = os.path.join(BASE_DIR, 'bin')
 DATA_DIR = os.path.join(BASE_DIR, 'data')
 TASKS_FILE = os.path.join(DATA_DIR, 'tasks.json')
 TOKENS_FILE = os.path.join(DATA_DIR, 'tokens.json')
+USERS_FILE = os.path.join(DATA_DIR, 'users.json')
+BIN_MAP_FILE = os.path.join(DATA_DIR, 'bin_map.json')  # filename → tokenId (MD5)
 RUN_TASK_JS = os.path.join(BASE_DIR, 'run_task.js')
 os.makedirs(BIN_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# ===== JWT_SECRET（可通过环境变量设置，留空则不验证）=====
+# ===== 配置 =====
 UPLOAD_SECRET = os.environ.get('UPLOAD_SECRET', '')
+# JWT 签名密钥（可通过环境变量覆盖）
+JWT_SECRET = os.environ.get('JWT_SECRET', 'xyzw_jwt_secret_change_me_in_prod')
+# session token 过期时间（秒），默认 24 小时
+SESSION_TTL = int(os.environ.get('SESSION_TTL', 86400))
+
+# ===== 内存 session 存储（tokenId -> {userId, role, exp}）=====
+_sessions: dict = {}
+
+
+# ===== 用户数据持久化 =====
+
+DEFAULT_ADMIN_PASSWORD_HASH = hashlib.sha256(b'xyzw@2024').hexdigest()
+
+def load_users() -> dict:
+    """从 users.json 读取用户数据，不存在则初始化默认管理员"""
+    try:
+        if os.path.isfile(USERS_FILE):
+            with open(USERS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, dict) and data:
+                    return data
+    except Exception:
+        pass
+    # 初始化默认 admin
+    default = {
+        'admin': {
+            'id': 'admin',
+            'username': 'admin',
+            'passwordHash': DEFAULT_ADMIN_PASSWORD_HASH,
+            'role': 'admin',
+            'assignedTokenIds': [],
+            'createdAt': now_shanghai().isoformat(),
+        }
+    }
+    save_users(default)
+    return default
+
+
+def save_users(users: dict):
+    with open(USERS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(users, f, ensure_ascii=False, indent=2)
+
+
+def load_bin_map() -> dict:
+    """filename -> tokenId (MD5) 映射"""
+    try:
+        if os.path.isfile(BIN_MAP_FILE):
+            with open(BIN_MAP_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def save_bin_map(m: dict):
+    with open(BIN_MAP_FILE, 'w', encoding='utf-8') as f:
+        json.dump(m, f, ensure_ascii=False, indent=2)
+
+
+# ===== Session 工具 =====
+
+def _make_session_token(user_id: str, role: str) -> str:
+    token = str(uuid.uuid4())
+    _sessions[token] = {
+        'userId': user_id,
+        'role': role,
+        'exp': now_shanghai() + timedelta(seconds=SESSION_TTL),
+    }
+    return token
+
+
+def _get_session(token: str) -> dict:
+    s = _sessions.get(token)
+    if not s:
+        return None
+    if now_shanghai() > s['exp']:
+        del _sessions[token]
+        return None
+    return s
+
+
+def require_auth(f):
+    """装饰器：需要登录才能访问"""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        token = request.headers.get('X-Session-Token', '')
+        session = _get_session(token)
+        if not session:
+            return jsonify({'error': '未登录或session已过期'}), 401
+        request.session = session
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def require_admin(f):
+    """装饰器：需要管理员权限"""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        token = request.headers.get('X-Session-Token', '')
+        session = _get_session(token)
+        if not session:
+            return jsonify({'error': '未登录或session已过期'}), 401
+        if session.get('role') != 'admin':
+            return jsonify({'error': '无管理员权限'}), 403
+        request.session = session
+        return f(*args, **kwargs)
+    return wrapper
+
+
+# ===== 用户管理 API =====
+
+@app.route('/api/users/login', methods=['POST'])
+def user_login():
+    """登录接口"""
+    body = request.get_json(silent=True) or {}
+    username = (body.get('username') or '').strip().lower()
+    password_hash = (body.get('passwordHash') or '').strip().lower()  # 前端已做 SHA-256
+
+    if not username or not password_hash:
+        return jsonify({'error': '用户名或密码不能为空'}), 400
+
+    users = load_users()
+    user = next((u for u in users.values() if u['username'].lower() == username), None)
+    if not user:
+        return jsonify({'error': '用户名不存在'}), 404
+    if user['passwordHash'] != password_hash:
+        return jsonify({'error': '密码错误'}), 401
+
+    token = _make_session_token(user['id'], user['role'])
+    return jsonify({
+        'token': token,
+        'user': {
+            'id': user['id'],
+            'username': user['username'],
+            'role': user['role'],
+        }
+    })
+
+
+@app.route('/api/users/logout', methods=['POST'])
+def user_logout():
+    token = request.headers.get('X-Session-Token', '')
+    if token in _sessions:
+        del _sessions[token]
+    return jsonify({'success': True})
+
+
+@app.route('/api/users/me', methods=['GET'])
+@require_auth
+def get_me():
+    """获取当前登录用户信息（含分配的 tokenIds）"""
+    users = load_users()
+    user = users.get(request.session['userId'])
+    if not user:
+        return jsonify({'error': '用户不存在'}), 404
+    return jsonify({
+        'id': user['id'],
+        'username': user['username'],
+        'role': user['role'],
+        'assignedTokenIds': user.get('assignedTokenIds', []),
+    })
+
+
+@app.route('/api/users', methods=['GET'])
+@require_admin
+def list_users():
+    """管理员：获取所有用户列表（不含密码哈希）"""
+    users = load_users()
+    result = [
+        {
+            'id': u['id'],
+            'username': u['username'],
+            'role': u['role'],
+            'assignedTokenIds': u.get('assignedTokenIds', []),
+            'createdAt': u.get('createdAt', ''),
+        }
+        for u in users.values()
+    ]
+    return jsonify(result)
+
+
+@app.route('/api/users', methods=['POST'])
+@require_admin
+def create_user():
+    """管理员：创建新用户"""
+    body = request.get_json(silent=True) or {}
+    username = (body.get('username') or '').strip()
+    password_hash = (body.get('passwordHash') or '').strip().lower()
+    role = body.get('role', 'user')
+
+    if not username or not password_hash:
+        return jsonify({'error': '用户名和密码不能为空'}), 400
+    if role not in ('admin', 'user'):
+        return jsonify({'error': '角色无效'}), 400
+
+    users = load_users()
+    if any(u['username'].lower() == username.lower() for u in users.values()):
+        return jsonify({'error': '用户名已存在'}), 409
+
+    new_id = f'user_{uuid.uuid4().hex[:8]}'
+    users[new_id] = {
+        'id': new_id,
+        'username': username,
+        'passwordHash': password_hash,
+        'role': role,
+        'assignedTokenIds': [],
+        'createdAt': now_shanghai().isoformat(),
+    }
+    save_users(users)
+    return jsonify({'success': True, 'id': new_id}), 201
+
+
+@app.route('/api/users/<user_id>', methods=['DELETE'])
+@require_admin
+def delete_user(user_id):
+    """管理员：删除用户（不能删除内置 admin）"""
+    if user_id == 'admin':
+        return jsonify({'error': '不能删除内置管理员账号'}), 400
+    users = load_users()
+    if user_id not in users:
+        return jsonify({'error': '用户不存在'}), 404
+    del users[user_id]
+    save_users(users)
+    return jsonify({'success': True})
+
+
+@app.route('/api/users/<user_id>/password', methods=['PUT'])
+@require_auth
+def change_password(user_id):
+    """修改密码：admin 可改任意人，普通用户只能改自己"""
+    session = request.session
+    if session['role'] != 'admin' and session['userId'] != user_id:
+        return jsonify({'error': '无权限修改该用户密码'}), 403
+
+    body = request.get_json(silent=True) or {}
+    new_hash = (body.get('passwordHash') or '').strip().lower()
+    if not new_hash:
+        return jsonify({'error': '密码不能为空'}), 400
+
+    users = load_users()
+    if user_id not in users:
+        return jsonify({'error': '用户不存在'}), 404
+
+    users[user_id]['passwordHash'] = new_hash
+    save_users(users)
+    return jsonify({'success': True})
+
+
+@app.route('/api/users/<user_id>/tokens', methods=['PUT'])
+@require_auth
+def assign_tokens(user_id):
+    """分配 token 可见性：admin 可修改任意用户，普通用户只能给自己追加"""
+    session = request.session
+    is_admin = session.get('role') == 'admin'
+    is_self = session.get('userId') == user_id
+
+    if not is_admin and not is_self:
+        return jsonify({'error': '无权限修改其他用户的 token 分配'}), 403
+
+    users = load_users()
+    if user_id not in users:
+        return jsonify({'error': '用户不存在'}), 404
+
+    body = request.get_json(silent=True) or {}
+    token_ids = body.get('tokenIds', [])
+    if not isinstance(token_ids, list):
+        return jsonify({'error': 'tokenIds 必须是数组'}), 400
+
+    if is_admin:
+        # 管理员可以任意覆盖
+        users[user_id]['assignedTokenIds'] = list(set(token_ids))
+    else:
+        # 普通用户只能追加（不能删除他人分配给自己的）
+        existing = set(users[user_id].get('assignedTokenIds', []))
+        users[user_id]['assignedTokenIds'] = list(existing | set(token_ids))
+
+    save_users(users)
+    return jsonify({'success': True})
+
 
 # ===== APScheduler =====
 scheduler = BackgroundScheduler(
@@ -99,30 +391,46 @@ def upload_bin():
     with open(filepath, 'wb') as f:
         f.write(data)
 
+    # 记录 filename → tokenId (MD5) 映射，供 list 过滤使用
+    token_id = hashlib.md5(data).hexdigest()
+    bin_map = load_bin_map()
+    bin_map[safe_name] = token_id
+    save_bin_map(bin_map)
+
     size = len(data)
-    print(f'[bin] 已保存: {safe_name} ({size} bytes)')
+    print(f'[bin] 已保存: {safe_name} ({size} bytes) tokenId={token_id}')
     return jsonify({'success': True, 'filename': safe_name, 'size': size})
 
 
 @app.route('/api/bin/list', methods=['GET'])
 def list_bins():
-    """列出服务器上所有已保存的 bin 文件"""
+    """列出 bin 文件。admin 返回全部，普通用户只返回 assignedTokenIds 对应的文件"""
     if not check_secret():
         return jsonify({'error': '密钥错误'}), 403
 
-    files = []
+    all_files = []
     for fname in sorted(os.listdir(BIN_DIR)):
         if not fname.endswith('.bin'):
             continue
         fpath = os.path.join(BIN_DIR, fname)
         stat = os.stat(fpath)
-        files.append({
+        all_files.append({
             'name': fname,
             'size': stat.st_size,
             'mtime': int(stat.st_mtime),
         })
 
-    return jsonify({'files': files})
+    # 尝试从 session 判断角色，普通用户按 assignedTokenIds 过滤
+    session_token = request.headers.get('X-Session-Token', '')
+    session = _get_session(session_token) if session_token else None
+    if session and session.get('role') != 'admin':
+        users = load_users()
+        user = users.get(session['userId'])
+        assigned = set(user.get('assignedTokenIds', [])) if user else set()
+        bin_map = load_bin_map()  # filename -> tokenId
+        all_files = [f for f in all_files if bin_map.get(f['name']) in assigned]
+
+    return jsonify({'files': all_files})
 
 
 @app.route('/api/bin/download/<filename>', methods=['GET'])
@@ -141,7 +449,7 @@ def download_bin(filename):
 
 @app.route('/api/bin/delete/<filename>', methods=['DELETE'])
 def delete_bin(filename):
-    """删除指定 bin 文件"""
+    """删除指定 bin 文件，同时清理 bin_map.json 中的记录"""
     if not check_secret():
         return jsonify({'error': '密钥错误'}), 403
 
@@ -151,6 +459,13 @@ def delete_bin(filename):
         return jsonify({'error': '文件不存在'}), 404
 
     os.remove(filepath)
+
+    # 清理映射记录
+    bin_map = load_bin_map()
+    if safe_name in bin_map:
+        del bin_map[safe_name]
+        save_bin_map(bin_map)
+
     return jsonify({'success': True})
 
 
@@ -204,7 +519,7 @@ def _fire_task(task_id):
         print(f'[scheduler] 任务 {task["name"]} 已禁用，跳过')
         return
 
-    print(f'[scheduler] {datetime.now()} 触发任务: {task["name"]}', flush=True)
+    print(f'[scheduler] {now_shanghai().strftime("%Y-%m-%d %H:%M:%S")} 触发任务: {task["name"]}', flush=True)
     print(f'[scheduler] tokens 路径: {TOKENS_FILE}, tasks 路径: {TASKS_FILE}', flush=True)
     try:
         proc = subprocess.Popen(
@@ -214,12 +529,12 @@ def _fire_task(task_id):
             stderr=subprocess.STDOUT,
         )
         task_json = json.dumps(task, ensure_ascii=False).encode('utf-8')
-        stdout, _ = proc.communicate(input=task_json, timeout=300)
+        stdout, _ = proc.communicate(input=task_json, timeout=600)
         print(stdout.decode('utf-8', errors='replace'))
         print(f'[scheduler] 任务 {task["name"]} 执行完毕，退出码: {proc.returncode}')
     except subprocess.TimeoutExpired:
         proc.kill()
-        print(f'[scheduler] 任务 {task["name"]} 超时（5分钟）已终止')
+        print(f'[scheduler] 任务 {task["name"]} 超时（10分钟）已终止')
     except Exception as e:
         print(f'[scheduler] 任务 {task["name"]} 启动失败: {e}')
 
@@ -344,6 +659,20 @@ def sync_tokens():
         }
 
     save_tokens(safe)
+
+    # 清理 users.json 中已不存在的 tokenId
+    valid_ids = set(safe.keys())
+    users = load_users()
+    changed = False
+    for user in users.values():
+        old = user.get('assignedTokenIds', [])
+        new = [tid for tid in old if tid in valid_ids]
+        if len(new) != len(old):
+            user['assignedTokenIds'] = new
+            changed = True
+    if changed:
+        save_users(users)
+
     return jsonify({'success': True, 'count': len(safe)})
 
 
@@ -391,6 +720,24 @@ if __name__ == '__main__':
         print(f'[xyzw-bin-server] 上传密钥已启用')
     else:
         print(f'[xyzw-bin-server] ⚠️  上传密钥未设置，任何人都可上传（建议设置 UPLOAD_SECRET 环境变量）')
+
+    # 补全历史 bin 文件的 filename→tokenId 映射（新增字段前上传的文件）
+    bin_map = load_bin_map()
+    updated = False
+    for fname in os.listdir(BIN_DIR):
+        if not fname.endswith('.bin') or fname in bin_map:
+            continue
+        try:
+            fpath = os.path.join(BIN_DIR, fname)
+            with open(fpath, 'rb') as f:
+                data = f.read()
+            bin_map[fname] = hashlib.md5(data).hexdigest()
+            updated = True
+        except Exception as e:
+            print(f'[bin_map] 补全失败: {fname} → {e}')
+    if updated:
+        save_bin_map(bin_map)
+        print(f'[bin_map] 已补全 bin_map.json，共 {len(bin_map)} 条记录')
 
     # 启动定时任务调度器
     _load_and_schedule_all()

@@ -28,6 +28,7 @@ declare module 'vue-router/auto-routes' {
     '/LegionWar': RouteRecordInfo<'/LegionWar', '/LegionWar', Record<never, never>, Record<never, never>>,
     '/Login': RouteRecordInfo<'/Login', '/Login', Record<never, never>, Record<never, never>>,
     '/NotFound': RouteRecordInfo<'/NotFound', '/NotFound', Record<never, never>, Record<never, never>>,
+    '/PasswordGate': RouteRecordInfo<'/PasswordGate', '/PasswordGate', Record<never, never>, Record<never, never>>,
     '/Profile': RouteRecordInfo<'/Profile', '/Profile', Record<never, never>, Record<never, never>>,
     '/Register': RouteRecordInfo<'/Register', '/Register', Record<never, never>, Record<never, never>>,
     '/TokenImport/': RouteRecordInfo<'/TokenImport/', '/TokenImport', Record<never, never>, Record<never, never>>,

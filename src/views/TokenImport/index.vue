@@ -76,7 +76,7 @@
       <div v-if="tokenStore.hasTokens" class="tokens-section">
         <div class="section-header">
           <n-space align="center">
-            <h2>我的Token列表 ({{ tokenStore.gameTokens.length }}个)</h2>
+            <h2>我的Token列表 ({{ visibleTokens.length }}个)</h2>
             <n-radio-group v-model:value="viewMode" size="small">
               <n-radio-button value="list">列表</n-radio-button>
               <n-radio-button value="card">卡片</n-radio-button>
@@ -628,6 +628,12 @@
         </div>
       </template>
     </n-modal>
+
+    <!-- Token 分配弹窗 (admin only) -->
+    <token-assign-modal
+      v-model="showAssignModal"
+      :token="assigningToken"
+    />
   </div>
 </template>
 
@@ -637,8 +643,11 @@ import UrlTokenForm from "./url.vue";
 import BinTokenForm from "./bin.vue";
 import singleBinTokenForm from "./singlebin.vue";
 import WxQrcodeForm from "./wxqrcode.vue";
+import TokenAssignModal from "@/components/Setting/TokenAssignModal.vue";
 
 import { useTokenStore, selectedTokenId } from "@/stores/tokenStore";
+import { useUserStore } from "@/stores/userStore";
+import { useVisibleTokens } from "@/composables/useVisibleTokens";
 import {
   Add,
   Copy,
@@ -649,6 +658,7 @@ import {
   Home,
   Key,
   Menu,
+  PeopleCircle,
   Refresh,
   Star,
   SyncCircle,
@@ -676,6 +686,12 @@ const router = useRouter();
 const message = useMessage();
 const dialog = useDialog();
 const tokenStore = useTokenStore();
+const userStore = useUserStore();
+const { visibleTokens } = useVisibleTokens();
+
+// Token 分配弹窗
+const showAssignModal = ref(false);
+const assigningToken = ref(null);
 
 // ============================================================
 // 本地文件同步
@@ -790,13 +806,14 @@ const sortConfig = ref(
       },
 );
 
-// 排序后的游戏角色Token列表
+// 排序后的游戏角色Token列表（仅当前用户可见）
 const sortedTokens = computed(() => {
+  const source = visibleTokens.value;
   if (sortConfig.value.field === 'manual') {
-    return tokenStore.gameTokens;
+    return source;
   }
 
-  return [...tokenStore.gameTokens].sort((tokenA, tokenB) => {
+  return [...source].sort((tokenA, tokenB) => {
     let valueA, valueB;
 
     // 根据排序字段获取比较值
@@ -1216,6 +1233,15 @@ const getTokenActions = (token) => {
     },
   );
 
+  // Admin 专属：分配用户
+  if (userStore.isAdmin) {
+    actions.splice(actions.length - 2, 0, {
+      label: "分配用户",
+      key: "assign",
+      icon: () => h(NIcon, null, { default: () => h(PeopleCircle) }),
+    });
+  }
+
   return actions;
 };
 
@@ -1237,6 +1263,10 @@ const handleTokenAction = async (key, token) => {
       break;
     case "delete":
       deleteToken(token);
+      break;
+    case "assign":
+      assigningToken.value = token;
+      showAssignModal.value = true;
       break;
   }
 };

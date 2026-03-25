@@ -205,6 +205,11 @@ export default defineConfig(async () => {
           target: "http://127.0.0.1:5001",
           changeOrigin: false,
         },
+        // 用户管理 API 代理（开发环境）
+        "/api/users": {
+          target: "http://127.0.0.1:5001",
+          changeOrigin: false,
+        },
       },
     },
     css: {

@@ -11,6 +11,7 @@ import { generateRandomSeed } from "@/utils/randomSeed";
 import { transformToken } from "@/utils/token";
 import { emitPlus } from "./events/index.js";
 import router from "@/router";
+import { useUserStore } from "@/stores/userStore";
 
 const { getArrayBuffer, storeArrayBuffer, deleteArrayBuffer, clearAll } = useIndexedDB();
 
@@ -27,6 +28,9 @@ declare interface TokenData {
   upgradedToPermanent?: boolean; // 是否升级为长期有效
   upgradedAt?: string; // 升级时间
   updatedAt?: string; // 更新时间
+  // 多租户可见性
+  ownerId?: string; // 创建该 token 的用户 ID；undefined 视为 admin 创建（所有人可见）
+  assignees?: string[]; // 被 admin 分配可见该 token 的普通用户 ID 列表
 }
 
 declare interface WebSocketConnection {
@@ -84,6 +88,16 @@ export const tokenGroups = useLocalStorage<TokenGroup[]>("tokenGroups", []);
 export const useTokenStore = defineStore("tokens", () => {
   const wsConnections = ref<WebCtx>({}); // WebSocket连接状态
   const connectionLocks = ref<LockCtx>({}); // 连接操作锁，防止竞态条件
+
+  // ---- 多租户可见性 ----
+  /** 分配 token 给普通用户 (admin only) */
+  const assignToken = (tokenId: string, userIds: string[]) => {
+    const token = gameTokens.value.find((t) => t.id === tokenId);
+    if (!token) return false;
+    token.assignees = [...new Set(userIds)];
+    return true;
+  };
+  // ---- end 多租户 ----
 
   // 游戏数据存储
   const gameData = ref({
@@ -214,6 +228,16 @@ export const useTokenStore = defineStore("tokens", () => {
   // Token管理
   const addToken = (tokenData: TokenData) => {
     let id = tokenData.id || `token_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    // 记录创建者，admin创建时 ownerId 留空（所有人可见）
+    let ownerId: string | undefined = undefined;
+    try {
+      // addToken 在 pinia 已初始化后才会被调用，直接访问 userStore 安全
+      const us = useUserStore();
+      if (!us.isAdmin && us.currentUserId) {
+        ownerId = us.currentUserId;
+      }
+    } catch { /* ignore */ }
+
     const newToken = {
       id: id,
       name: tokenData.name,
@@ -230,10 +254,26 @@ export const useTokenStore = defineStore("tokens", () => {
       sourceUrl: tokenData.sourceUrl || null, // Token来源URL（用于刷新）
       importMethod: tokenData.importMethod || "manual", // 导入方式：manual 或 url
       avatar: tokenData.avatar || "", // 用户头像
+      // 多租户
+      ownerId,
+      assignees: [],
     };
 
     gameTokens.value.push(newToken);
     syncTokensToServer();
+
+    // 普通用户新增 Token 后，自动将其写入后端 users.json 的 assignedTokenIds
+    // 确保从其他浏览器登录时也能通过 users.json 识别归属，不依赖 localStorage ownerId
+    if (ownerId) {
+      try {
+        const us = useUserStore();
+        const existing: string[] = us.assignedTokenIds ?? [];
+        if (!existing.includes(newToken.id)) {
+          us.assignTokensToUser(ownerId, [...existing, newToken.id]).catch(() => {});
+        }
+      } catch { /* ignore */ }
+    }
+
     return newToken;
   };
 
@@ -1650,6 +1690,9 @@ export const useTokenStore = defineStore("tokens", () => {
     getValidGroupTokenIds,
     cleanupInvalidTokens,
     syncTokensToServer,
+
+    // 多租户
+    assignToken,
 
     // 开发者工具
     devTools: {

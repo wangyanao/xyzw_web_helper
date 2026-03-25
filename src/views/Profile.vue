@@ -101,6 +101,27 @@
       <h2>Token管理</h2>
       <TokenManager />
 
+      <!-- 管理员专属：用户管理 -->
+      <template v-if="userStore.isAdmin">
+        <h2>用户管理</h2>
+        <a-card>
+          <UserManager />
+        </a-card>
+      </template>
+
+      <h2>账号</h2>
+      <a-card>
+        <div class="security-items">
+          <div class="security-item">
+            <div class="security-info">
+              <h3>当前登录</h3>
+              <p>{{ userStore.currentUser?.username }}（{{ userStore.isAdmin ? '管理员' : '普通用户' }}）</p>
+            </div>
+            <n-button type="error" @click="handleLogout">退 出</n-button>
+          </div>
+        </div>
+      </a-card>
+
       <h2>账户安全</h2>
       <a-card>
         <div class="security-items">
@@ -146,12 +167,19 @@ import { ref, reactive, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import { useMessage, useDialog } from "naive-ui";
 import { useAuthStore } from "@/stores/auth";
+import { useUserStore } from "@/stores/userStore";
 
 const router = useRouter();
 const message = useMessage();
 const dialog = useDialog();
 const authStore = useAuthStore();
+const userStore = useUserStore();
 const passwordFormRef = ref(null);
+
+const handleLogout = async () => {
+  await userStore.logout();
+  router.replace('/auth');
+};
 
 // 用户信息
 const userInfo = reactive({
@@ -219,20 +247,39 @@ const saveProfile = async () => {
 };
 
 const changePassword = async () => {
-  if (!passwordFormRef.value) return;
-
-  try {
-    await passwordFormRef.value.validate();
-
-    // 这里应该调用API修改密码
-    message.success("密码修改成功");
-
-    // 清空表单
-    Object.keys(passwordForm).forEach((key) => {
-      passwordForm[key] = "";
-    });
-  } catch (error) {
-    // 验证失败
+  if (!passwordForm.currentPassword) {
+    message.warning("请输入当前密码");
+    return;
+  }
+  if (!passwordForm.newPassword) {
+    message.warning("请输入新密码");
+    return;
+  }
+  if (passwordForm.newPassword !== passwordForm.confirmPassword) {
+    message.error("两次输入的新密码不一致");
+    return;
+  }
+  // 先验证旧密码是否正确（重新登录）
+  const verifyResult = await userStore.login(
+    userStore.currentUser?.username,
+    passwordForm.currentPassword,
+  );
+  if (verifyResult !== true) {
+    message.error("当前密码错误");
+    return;
+  }
+  // 修改密码
+  const ok = await userStore.changePassword(
+    userStore.currentUser?.id,
+    passwordForm.newPassword,
+  );
+  if (ok) {
+    message.success("密码修改成功，请重新登录");
+    Object.keys(passwordForm).forEach((key) => { passwordForm[key] = ""; });
+    await userStore.logout();
+    router.replace("/auth");
+  } else {
+    message.error("密码修改失败");
   }
 };
 

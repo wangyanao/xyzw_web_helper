@@ -2312,6 +2312,7 @@ import {
   h,
 } from "vue";
 import { useTokenStore, gameTokens, tokenGroups } from "@/stores/tokenStore";
+import { useVisibleTokens } from "@/composables/useVisibleTokens";
 import { DailyTaskRunner } from "@/utils/dailyTaskRunner";
 import { preloadQuestions } from "@/utils/studyQuestionsFromJSON.js";
 import { useMessage } from "naive-ui";
@@ -2375,6 +2376,7 @@ import { merchantConfig, goldItemsConfig } from "@/utils/dreamConstants";
 
 // Initialize token store, message service, and task runner
 const tokenStore = useTokenStore();
+const { visibleTokens } = useVisibleTokens();
 const message = useMessage();
 
 // 排序配置（从localStorage读取，与TokenImport共享）
@@ -2408,7 +2410,7 @@ const towerEnergy = computed(() => {
 
 // 排序后的游戏角色Token列表
 const sortedTokens = computed(() => {
-  return [...tokenStore.gameTokens].sort((tokenA, tokenB) => {
+  return [...visibleTokens.value].sort((tokenA, tokenB) => {
     let valueA, valueB;
 
     // 根据排序字段获取比较值
@@ -2467,7 +2469,7 @@ const getSortIcon = (field) => {
   return sortConfig.value.direction === "asc" ? "↑" : "↓";
 };
 
-const tokens = computed(() => tokenStore.gameTokens);
+const tokens = computed(() => visibleTokens.value);
 const isCarActivityOpen = computed(() => {
   const now = new Date();
   const day = now.getDay();

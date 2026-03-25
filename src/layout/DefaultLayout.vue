@@ -66,6 +66,14 @@
             </n-icon>
             <span>实时盐场</span>
           </router-link>
+          <router-link
+            to="/admin/profile"
+            class="nav-item"
+            active-class="active"
+          >
+            <n-icon><Settings /></n-icon>
+            <span>设置</span>
+          </router-link>
         </div>
 
         <div class="nav-user">
@@ -79,9 +87,7 @@
                 size="medium"
                 fallback-src="/icons/xiaoyugan.png"
               />
-              <span class="username">{{
-                selectedToken?.name || "未选择Token"
-              }}</span>
+              <span class="username">{{ userStore.currentUser?.username || selectedToken?.name || '未登录' }}</span>
               <n-icon>
                 <ChevronDown />
               </n-icon>
@@ -201,29 +207,50 @@ import {
 
 import { useRouter } from 'vue-router'
 import { useMessage } from 'naive-ui'
-import { ref } from 'vue'
+import { ref, computed, h } from 'vue'
 import { isNowInLegionWarTime } from '@/utils/clubBattleUtils'
+import { useUserStore } from '@/stores/userStore'
 
 const tokenStore = useTokenStore();
+const userStore = useUserStore();
 const router = useRouter();
 const message = useMessage();
 
 const isMobileMenuOpen = ref(false);
 
-const userMenuOptions = [
+const userMenuOptions = computed(() => [
   {
-    label: "清除所有Token并退出",
-    key: "logout",
+    label: '个人设置',
+    key: 'profile',
   },
-];
+  {
+    type: 'divider',
+  },
+  {
+    label: '退出登录',
+    key: 'logout',
+  },
+  {
+    label: '清除所有Token并退出',
+    key: 'clear-logout',
+  },
+]);
 
 // 方法
 const handleUserAction = async (key) => {
   switch (key) {
-    case "logout":
+    case 'profile':
+      router.push('/admin/profile');
+      break;
+    case 'logout':
+      await userStore.logout();
+      router.replace('/auth');
+      break;
+    case 'clear-logout':
       await tokenStore.clearAllTokens();
-      message.success("已清除所有Token");
-      router.push("/tokens");
+      await userStore.logout();
+      message.success('已清除所有Token并退出');
+      router.replace('/auth');
       break;
   }
 };

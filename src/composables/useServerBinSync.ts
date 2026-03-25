@@ -15,6 +15,11 @@ interface BinFileInfo {
  * 从服务器拉取 bin 文件列表并导入 token
  * @returns 成功导入的 token 数组，失败时返回空数组
  */
+function sessionHeaders(): Record<string, string> {
+  const t = sessionStorage.getItem('xyzw_session_token') || ''
+  return t ? { 'X-Session-Token': t } : {}
+}
+
 export const syncBinsFromServer = async (): Promise<{
   id: string;
   name: string;
@@ -25,7 +30,7 @@ export const syncBinsFromServer = async (): Promise<{
   // 1. 获取 bin 文件列表
   let files: BinFileInfo[] = [];
   try {
-    const resp = await fetch('/api/bin/list');
+    const resp = await fetch('/api/bin/list', { headers: sessionHeaders() });
     if (!resp.ok) return [];
     const json = await resp.json();
     files = json.files ?? [];
@@ -47,7 +52,7 @@ export const syncBinsFromServer = async (): Promise<{
   // 2. 逐个下载并解析
   for (const file of files) {
     try {
-      const dlResp = await fetch(`/api/bin/download/${encodeURIComponent(file.name)}`);
+      const dlResp = await fetch(`/api/bin/download/${encodeURIComponent(file.name)}`, { headers: sessionHeaders() });
       if (!dlResp.ok) continue;
 
       const arrayBuffer = await dlResp.arrayBuffer();
