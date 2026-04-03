@@ -139,7 +139,7 @@ const message = useMessage();
 const loading = ref(false);
 const switching = ref(false);
 const currentTeam = ref(1);
-const availableTeams = ref([1, 2, 3, 4]);
+const availableTeams = ref([1, 2]);
 
 // —— 角色身份卡相关状态 ——
 // 默认头像列表（当角色头像为空时随机选择）
@@ -448,7 +448,7 @@ const updateAvailableTeams = () => {
     .map(Number)
     .filter((n) => !Number.isNaN(n))
     .sort((a, b) => a - b);
-  availableTeams.value = ids.length ? ids : [1, 2, 3, 4];
+  availableTeams.value = ids.length ? ids : [1, 2];
 };
 const updateCurrentTeam = () => {
   currentTeam.value = presetTeam.value.useTeamId || 1;
@@ -459,6 +459,10 @@ const selectTeam = async (teamId) => {
   if (switching.value || loading.value) return;
   if (!tokenStore.selectedToken) {
     message.warning("请先选择Token");
+    return;
+  }
+  if (!availableTeams.value.includes(teamId)) {
+    message.warning(`当前账号未返回阵容 ${teamId} 数据，无法切换`);
     return;
   }
   const prev = currentTeam.value;

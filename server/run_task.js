@@ -4,10 +4,12 @@
  * 任务 JSON 通过 stdin 传入
  */
 
-import { readFileSync, readdirSync } from 'fs';
+import { readFileSync, readdirSync, writeFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { createHash } from 'crypto';
+import { request as httpsRequest } from 'https';
+import { request as httpRequest } from 'http';
 import GameClient, { transformTokenFromBin } from './gameClient.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -58,6 +60,196 @@ function log(name, msg, level = 'info') {
 
 // 延迟工具
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function refreshConnectionParams(tokenStr) {
+  try {
+    const tokenObj = JSON.parse(tokenStr);
+    if (tokenObj && typeof tokenObj === 'object' && (tokenObj.sessId !== undefined || tokenObj.connId !== undefined)) {
+      const now = Date.now();
+      tokenObj.sessId = now * 100 + Math.floor(Math.random() * 100);
+      tokenObj.connId = now + Math.floor(Math.random() * 10);
+      tokenObj.isRestore = 0;
+      return JSON.stringify(tokenObj);
+    }
+  } catch {
+    // 非 JSON token（例如纯 roleToken 字符串）不处理
+  }
+  return tokenStr;
+}
+
+/**
+ * 对于 importMethod==='url' 的 token，从 sourceUrl 重新拉取最新 token
+ */
+async function refreshTokenFromUrl(tokenData, tokenName) {
+  const sourceUrl = tokenData?.sourceUrl;
+  if (!sourceUrl) {
+    log(tokenName, `url 类型但无 sourceUrl，无法刷新`, 'warning');
+    return null;
+  }
+  try {
+    const fresh = await new Promise((resolve, reject) => {
+      const isHttps = sourceUrl.startsWith('https');
+      const doRequest = isHttps ? httpsRequest : httpRequest;
+      const req = doRequest(sourceUrl, { method: 'GET', headers: { Accept: 'application/json' } }, (res) => {
+        const chunks = [];
+        res.on('data', c => chunks.push(c));
+        res.on('end', () => {
+          try {
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+            if (!body.token) throw new Error('返回数据中未找到 token 字段');
+            resolve(body.token);
+          } catch (e) { reject(e); }
+        });
+      });
+      req.on('error', reject);
+      req.setTimeout(15000, () => { req.destroy(); reject(new Error('URL 请求超时')); });
+      req.end();
+    });
+    log(tokenName, `已从 URL 刷新 token`, 'info');
+    return fresh;
+  } catch (e) {
+    log(tokenName, `从 URL 刷新 token 失败: ${e.message}，回退到已存储 token`, 'warning');
+    return null;
+  }
+}
+
+async function buildFreshActiveToken(tokenData, tokenId, tokenName, fallbackToken = '') {
+  let nextToken = fallbackToken || tokenData?.token || '';
+  const method = tokenData?.importMethod || 'manual';
+
+  if (method === 'bin' || method === 'wxQrcode') {
+    // bin/wxQrcode: 用原始 bin 文件重新 POST authuser 获取新 roleToken
+    const fresh = await refreshTokenFromBin(tokenId, tokenName);
+    if (fresh) {
+      nextToken = fresh;
+    } else {
+      log(tokenName, `[${method}] bin 刷新失败，尝试仅刷新连接参数`, 'warning');
+    }
+  } else if (method === 'url') {
+    // url: 从 sourceUrl 重新拉取完整 token
+    const fresh = await refreshTokenFromUrl(tokenData, tokenName);
+    if (fresh) {
+      nextToken = fresh;
+    } else {
+      log(tokenName, `[url] URL 刷新失败，尝试仅刷新连接参数`, 'warning');
+    }
+  } else {
+    // manual 等类型：无法自动刷新 roleToken，仅刷新 sessId/connId
+    log(tokenName, `[${method}] 无自动刷新源，仅刷新连接参数`, 'info');
+  }
+
+  return refreshConnectionParams(nextToken);
+}
+
+// 连接状态判定：仅 _connected=true 不够，还要确保 ws 处于 OPEN
+function hasActiveConnection(client) {
+  return Boolean(client?._connected && client?._ws && client._ws.readyState === 1);
+}
+
+function isConnectionError(err) {
+  const msg = String(err?.message || '');
+  return (
+    msg.includes('未连接') ||
+    msg.includes('连接已断开') ||
+    msg.includes('连接超时') ||
+    msg.includes('WebSocket is not open') ||
+    msg.includes('ECONNRESET') ||
+    msg.includes('EPIPE') ||
+    msg.includes('ETIMEDOUT') ||
+    msg.includes('socket hang up')
+  );
+}
+
+/**
+ * 自动重连机制：检查连接状态，如果断开则重新连接
+ * @param {GameClient} client - 游戏客户端
+ * @param {string} tokenName - token 名称
+ * @param {string} activeToken - 当前 token 字符串
+ * @param {number} maxRetries - 最大重试次数
+ */
+async function ensureConnected(client, tokenName, getActiveToken, maxRetries = 3) {
+  const retryErrors = []; // 追踪所有重试的错误
+  
+  for (let retry = 0; retry < maxRetries; retry++) {
+    try {
+      // 检查当前连接状态（如果已连接则不重连）
+      if (hasActiveConnection(client)) {
+        return true;
+      }
+
+      // 清理可能的半开连接，避免出现 _connected 与 readyState 不一致
+      if (client?._ws && client._ws.readyState !== 1) {
+        try { client.disconnect(); } catch {}
+        await sleep(150);
+      }
+
+      const activeToken = await getActiveToken();
+      
+      log(tokenName, `重新连接中... (尝试 ${retry + 1}/${maxRetries})`);
+      await client.connect(activeToken);
+      log(tokenName, '重连成功');
+      return true;
+    } catch (err) {
+      // 详细记录每次重试的错误（包括错误代码、消息、堆栈）
+      const errorDetail = {
+        retry: retry + 1,
+        message: err.message,
+        code: err.code || 'UNKNOWN',
+        timestamp: new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
+      };
+      retryErrors.push(errorDetail);
+      
+      log(tokenName, `重连失败 (${retry + 1}/${maxRetries}): ${err.message} [${err.code || 'N/A'}]`, 'warning');
+      
+      if (retry < maxRetries - 1) {
+        await sleep(2000); // 等待 2 秒后重试
+      }
+    }
+  }
+  
+  // 汇总输出所有重试的错误信息
+  log(tokenName, `重连失败：已达最大重试次数 ${maxRetries}。错误详情: ${JSON.stringify(retryErrors)}`, 'error');
+  return false;
+}
+
+function applyResilientSendWrapper(client, tokenName, getActiveToken, maxRetries = 3) {
+  if (client._resilientSendWrapped) return;
+
+  const rawSendWithPromise = client.sendWithPromise.bind(client);
+
+  client.sendWithPromise = async (cmd, params = {}, timeout = 10000) => {
+    let lastErr = null;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      if (!hasActiveConnection(client)) {
+        const ok = await ensureConnected(client, tokenName, getActiveToken, maxRetries);
+        if (!ok) {
+          throw new Error(`命令 ${cmd} 执行前重连失败`);
+        }
+      }
+
+      try {
+        return await rawSendWithPromise(cmd, params, timeout);
+      } catch (err) {
+        lastErr = err;
+        if (!isConnectionError(err) || attempt === maxRetries) {
+          throw err;
+        }
+
+        log(tokenName, `命令 ${cmd} 连接异常，准备重连后重试 (${attempt}/${maxRetries}): ${err.message}`, 'warning');
+        const ok = await ensureConnected(client, tokenName, getActiveToken, maxRetries);
+        if (!ok) {
+          throw err;
+        }
+        await sleep(200);
+      }
+    }
+
+    throw lastErr || new Error(`命令 ${cmd} 执行失败`);
+  };
+
+  client._resilientSendWrapped = true;
+}
 
 // ============================================================
 // 单个命令执行（带容错）
@@ -190,9 +382,45 @@ async function runDailyBasic(client, tokenName, delay = 500) {
   }
 
   // ── 10. 任务积分 + 日常/周常/通行证奖励（关键：前端最后一步）──
+  // 注：任务积分对应关系
+  // taskId 1-2: 基础任务（分享、赠送）
+  // taskId 3-4: 竞技场/爬塔
+  // taskId 5-6: 活动相关
+  // 只有当任务完成 (dailyTask.complete[taskId] === -1) 才能领取
+  const taskIdToCondition = {
+    1: 2,   // 分享游戏
+    2: 3,   // 赠送好友
+    3: 4,   // 免费招募
+    4: 6,   // 免费点金
+    5: 5,   // 领取挂机
+    6: 7,   // 开启宝箱
+    7: 12,  // 黑市购买
+    8: 14,  // 盐罐相关
+    9: null, // 可能是竞技场或其他
+    10: null // 可能是活动或其他
+  };
+
   for (let taskId = 1; taskId <= 10; taskId++) {
-    await execCmd(client, tokenName, 'task_claimdailypoint', { taskId }, `领取任务积分 ${taskId}/10`); await sleep(delay);
+    try {
+      // 对于已知的任务条件，先检查是否完成；对于未知的，直接尝试领取
+      const conditionId = taskIdToCondition[taskId];
+      if (conditionId !== null && !isTaskDone(conditionId)) {
+        log(tokenName, `⊘ 任务积分 ${taskId}/10 尚未达成完成条件，跳过`, 'info');
+        continue;
+      }
+      
+      await execCmd(client, tokenName, 'task_claimdailypoint', { taskId }, `领取任务积分 ${taskId}/10`);
+      await sleep(delay);
+    } catch (err) {
+      // 700010 错误表示任务未完成，直接跳过不打印错误
+      if (err.message?.includes('700010')) {
+        log(tokenName, `⊘ 任务积分 ${taskId}/10 尚未达成完成条件，跳过`, 'info');
+      } else {
+        log(tokenName, `⚠️  领取任务积分 ${taskId}/10 失败: ${err.message}`, 'warning');
+      }
+    }
   }
+
   await execCmd(client, tokenName, 'task_claimdailyreward', {}, '领取日常任务奖励箱'); await sleep(delay);
   await execCmd(client, tokenName, 'task_claimweekreward',  {}, '领取周常任务奖励箱'); await sleep(delay);
   await execCmd(client, tokenName, 'activity_recyclewarorderrewardclaim', { actId: 1 }, '领取通行证奖励'); await sleep(delay);
@@ -656,27 +884,442 @@ function canClaim(car) {
   return Date.now() - tsMs >= 4 * 60 * 60 * 1000;
 }
 
-/** 智能发车（简化版：直接发所有未出发的车） */
-async function runSmartSendCar(client, tokenName, delay = 500) {
+/**
+ * 检查车辆奖励是否满足自定义条件（对齐前端 checkRewardConditions）
+ * @param {Array} rewards - 奖励列表
+ * @param {object} conditions - { gold, recruit, jade, ticket }
+ * @param {boolean} matchAll - true: AND, false: OR
+ */
+function checkRewardConditions(rewards, conditions, matchAll = false) {
+  if (!Array.isArray(rewards) || !conditions) return false;
+  const { gold = 0, recruit = 0, jade = 0, ticket = 0 } = conditions;
+  if (!gold && !recruit && !jade && !ticket) return false;
+
+  let goldCount = 0, recruitCount = 0, jadeCount = 0, ticketCount = 0;
+  for (const r of rewards) {
+    const val = Number(r.value || r.num || r.quantity || r.count || 0);
+    const type = Number(r.type || 0);
+    const itemId = Number(r.itemId || 0);
+    if (type === 2) goldCount += val;           // 金砖
+    if (itemId === 1001) recruitCount += val;   // 招募令
+    if (itemId === 1022) jadeCount += val;      // 白玉
+    if (itemId === 35002) ticketCount += val;   // 刷新券
+  }
+
+  if (matchAll) {
+    if (gold > 0 && goldCount < gold) return false;
+    if (recruit > 0 && recruitCount < recruit) return false;
+    if (jade > 0 && jadeCount < jade) return false;
+    if (ticket > 0 && ticketCount < ticket) return false;
+    return true;
+  } else {
+    if (gold > 0 && goldCount >= gold) return true;
+    if (recruit > 0 && recruitCount >= recruit) return true;
+    if (jade > 0 && jadeCount >= jade) return true;
+    if (ticket > 0 && ticketCount >= ticket) return true;
+    return false;
+  }
+}
+
+/** 统计赛车刷新券数量 */
+function countRacingRefreshTickets(rewards) {
+  if (!Array.isArray(rewards)) return 0;
+  let cnt = 0;
+  for (const r of rewards) {
+    if (Number(r.itemId || 0) === 35002) cnt += Number(r.value || r.num || r.quantity || 0);
+  }
+  return cnt;
+}
+
+/** 判断是否大奖车（对齐前端 isBigPrize） */
+function isBigPrize(rewards) {
+  if (!Array.isArray(rewards)) return false;
+  for (const r of rewards) {
+    const type = Number(r.type || 0);
+    const itemId = Number(r.itemId || 0);
+    const val = Number(r.value || 0);
+    // 金砖 >=500 或 招募令 >=5 或 红色碎片
+    if (type === 2 && val >= 500) return true;
+    if (itemId === 1001 && val >= 5) return true;
+    if (itemId === 3201) return true;
+  }
+  return false;
+}
+
+/**
+ * 判断是否应该发车（对齐前端 shouldSendCar）
+ */
+function shouldSendCar(car, tickets, minColor = 4, customConditions = {}, useGoldRefreshFallback = false, matchAll = false) {
+  const color = Number(car?.color || 0);
+  const rewards = Array.isArray(car?.rewards) ? car.rewards : [];
+  const customConditionsMet = checkRewardConditions(rewards, customConditions, matchAll);
+
+  if (useGoldRefreshFallback) {
+    if (color < minColor) return false;
+    const hasConditions = (customConditions.gold > 0 || customConditions.recruit > 0 || customConditions.jade > 0 || customConditions.ticket > 0);
+    if (hasConditions) return customConditionsMet;
+    return true;
+  }
+
+  if (customConditionsMet) return true;
+
+  const racingTickets = countRacingRefreshTickets(rewards);
+  if (tickets >= 6) {
+    return color >= minColor && (color >= 5 || racingTickets >= 4 || isBigPrize(rewards));
+  }
+  return color >= minColor || racingTickets >= 2 || isBigPrize(rewards);
+}
+
+const GRADE_LABELS = { 1: '绿·普通', 2: '蓝·稀有', 3: '紫·史诗', 4: '橙·传说', 5: '红·神话', 6: '金·传奇' };
+function gradeLabel(color) { return GRADE_LABELS[color] || `未知(${color})`; }
+
+/** 智能发车（完整版：支持条件判断、刷新、金砖保底） */
+async function runSmartSendCar(client, tokenName, settings = {}, delay = 500) {
+  const minColor = settings.carMinColor ?? 4;
+  const useGoldRefreshFallback = settings.useGoldRefreshFallback ?? false;
+  const matchAll = settings.smartDepartureMatchAll ?? false;
+  const customConditions = {
+    gold: settings.smartDepartureGoldThreshold ?? 0,
+    recruit: settings.smartDepartureRecruitThreshold ?? 0,
+    jade: settings.smartDepartureJadeThreshold ?? 0,
+    ticket: settings.smartDepartureTicketThreshold ?? 0,
+  };
+
+  const hasConditions = (customConditions.gold > 0 || customConditions.recruit > 0 || customConditions.jade > 0 || customConditions.ticket > 0);
+
+  log(tokenName, `智能发车配置: 保底颜色=${gradeLabel(minColor)}, 金砖保底=${useGoldRefreshFallback}, 满足所有=${matchAll}, ` +
+    `条件: 金砖>=${customConditions.gold} 招募令>=${customConditions.recruit} 白玉>=${customConditions.jade} 刷新券>=${customConditions.ticket}`);
+
   try {
     const res = await client.sendWithPromise('car_getrolecar', {}, 10000);
     const cars = normalizeCars(res);
     log(tokenName, `智能发车：共找到 ${cars.length} 辆车`);
-    if (cars.length > 0) {
-      // 调试：打印第一辆车的字段，方便排查发车条件
-      const sample = cars[0];
-      log(tokenName, `[调试] 车辆样例: id=${sample.id} sendAt=${sample.sendAt} color=${sample.color} status=${sample.status}`, 'info');
-    }
+
+    // 获取刷新券数量
+    let refreshTickets = 0;
+    try {
+      const roleRes = await client.sendWithPromise('role_getroleinfo', {}, 8000);
+      refreshTickets = Number(roleRes?.role?.items?.[35002]?.quantity || 0);
+      log(tokenName, `剩余刷新券: ${refreshTickets}`);
+    } catch (_) {}
+
     let sent = 0;
     for (const car of cars) {
       const sendAt = Number(car.sendAt ?? car.sendtime ?? car.send_at ?? 0);
       if (sendAt !== 0) continue; // 已在路上
-      await execCmd(client, tokenName, 'car_send', { carId: String(car.id), helperId: 0, text: '', isUpgrade: false }, `发车[id:${car.id} 色:${car.color}]`, 10000);
-      sent++;
-      await sleep(delay);
+
+      const effectiveTickets = useGoldRefreshFallback ? 999 : refreshTickets;
+
+      // 1. 检查是否满足发车条件
+      if (shouldSendCar(car, effectiveTickets, minColor, customConditions, useGoldRefreshFallback, matchAll)) {
+        log(tokenName, `车辆[${gradeLabel(car.color)}] 满足条件，直接发车`);
+        await execCmd(client, tokenName, 'car_send', { carId: String(car.id), helperId: 0, text: '', isUpgrade: false }, `发车[${gradeLabel(car.color)}]`, 10000);
+        sent++;
+        await sleep(delay);
+        continue;
+      }
+
+      // 2. 不满足条件，尝试刷新
+      let canRefresh = false;
+      const free = Number(car.refreshCount ?? 0) === 0;
+      const useGoldFallback = useGoldRefreshFallback && !free && refreshTickets < 6;
+
+      if (refreshTickets >= 6) canRefresh = true;
+      else if (free) canRefresh = true;
+      else if (useGoldFallback) {
+        canRefresh = true;
+        log(tokenName, `车辆[${gradeLabel(car.color)}] 启用金砖刷新`, 'warning');
+      } else {
+        // 无法刷新，直接发车
+        log(tokenName, `车辆[${gradeLabel(car.color)}] 不满足条件且无刷新次数，直接发车`, 'warning');
+        await execCmd(client, tokenName, 'car_send', { carId: String(car.id), helperId: 0, text: '', isUpgrade: false }, `发车[${gradeLabel(car.color)}]`, 10000);
+        sent++;
+        await sleep(delay);
+        continue;
+      }
+
+      // 3. 刷新循环
+      while (canRefresh) {
+        log(tokenName, `车辆[${gradeLabel(car.color)}] 尝试刷新...`);
+        try {
+          const resp = await client.sendWithPromise('car_refresh', { carId: String(car.id) }, 10000);
+          const data = resp?.car || resp?.body?.car || resp;
+          if (data && typeof data === 'object') {
+            if (data.color != null) car.color = Number(data.color);
+            if (data.refreshCount != null) car.refreshCount = Number(data.refreshCount);
+            if (data.rewards != null) car.rewards = data.rewards;
+          }
+        } catch (e) {
+          log(tokenName, `刷新失败: ${e.message}`, 'warning');
+          break;
+        }
+
+        // 更新刷新券数量
+        try {
+          const roleRes = await client.sendWithPromise('role_getroleinfo', {}, 5000);
+          refreshTickets = Number(roleRes?.role?.items?.[35002]?.quantity || 0);
+        } catch (_) {}
+
+        // 刷新后检查是否满足条件
+        if (shouldSendCar(car, useGoldRefreshFallback ? 999 : refreshTickets, minColor, customConditions, useGoldRefreshFallback, matchAll)) {
+          log(tokenName, `刷新后车辆[${gradeLabel(car.color)}] 满足条件，发车`, 'success');
+          await execCmd(client, tokenName, 'car_send', { carId: String(car.id), helperId: 0, text: '', isUpgrade: false }, `发车[${gradeLabel(car.color)}]`, 10000);
+          sent++;
+          await sleep(delay);
+          break;
+        }
+
+        // 检查是否可以继续刷新
+        const freeNow = Number(car.refreshCount ?? 0) === 0;
+        const useGoldFallbackNow = useGoldRefreshFallback && !freeNow && refreshTickets < 6;
+
+        if (refreshTickets >= 6) canRefresh = true;
+        else if (freeNow) canRefresh = true;
+        else if (useGoldFallbackNow) {
+          canRefresh = true;
+          log(tokenName, `车辆[${gradeLabel(car.color)}] 继续金砖刷新`, 'warning');
+        } else {
+          // 无法继续刷新，直接发车
+          log(tokenName, `车辆[${gradeLabel(car.color)}] 刷新结束（无票），直接发车`, 'warning');
+          await execCmd(client, tokenName, 'car_send', { carId: String(car.id), helperId: 0, text: '', isUpgrade: false }, `发车[${gradeLabel(car.color)}]`, 10000);
+          sent++;
+          await sleep(delay);
+          break;
+        }
+
+        await sleep(1000); // 刷新间隔
+      }
     }
     log(tokenName, `✅ 智能发车完成，共发 ${sent} 辆`, 'success');
   } catch (err) { log(tokenName, `智能发车失败: ${err.message}`, 'warning'); }
+}
+
+/** 批量开箱 */
+async function runBatchOpenBox(client, tokenName, batchSettings = {}, delay = 500) {
+  const boxType = batchSettings.defaultBoxType ?? 2001;
+  const totalCount = batchSettings.boxCount ?? 100;
+  const boxNames = { 2001: '木质宝箱', 2002: '青铜宝箱', 2003: '黄金宝箱', 2004: '铂金宝箱' };
+  log(tokenName, `批量开箱：${boxNames[boxType] || boxType} x ${totalCount}`);
+  try {
+    const batches = Math.floor(totalCount / 10);
+    const remainder = totalCount % 10;
+    for (let i = 0; i < batches; i++) {
+      await execCmd(client, tokenName, 'item_openbox', { itemId: boxType, number: 10 }, `开箱 ${(i + 1) * 10}/${totalCount}`);
+      await sleep(delay);
+    }
+    if (remainder > 0) {
+      await execCmd(client, tokenName, 'item_openbox', { itemId: boxType, number: remainder }, `开箱 ${totalCount}/${totalCount}`);
+      await sleep(delay);
+    }
+    await execCmd(client, tokenName, 'item_batchclaimboxpointreward', {}, '自动领取宝箱积分');
+    log(tokenName, `✅ 批量开箱完成`, 'success');
+  } catch (err) { log(tokenName, `批量开箱失败: ${err.message}`, 'warning'); }
+}
+
+/** 按积分开箱 */
+async function runBatchOpenBoxByPoints(client, tokenName, batchSettings = {}, delay = 500) {
+  const targetPoints = batchSettings.targetBoxPoints ?? 1000;
+  const boxPriority = [
+    { id: 2001, name: '木质宝箱', points: 1, reserve: 200 },
+    { id: 2002, name: '青铜宝箱', points: 10, reserve: 0 },
+    { id: 2003, name: '黄金宝箱', points: 20, reserve: 0 },
+    { id: 2004, name: '铂金宝箱', points: 50, reserve: 0 },
+  ];
+  log(tokenName, `按积分开箱：目标 ${targetPoints} 积分`);
+  try {
+    const roleRes = await client.sendWithPromise('role_getroleinfo', {}, 8000);
+    const items = roleRes?.role?.items || {};
+    const boxInventory = {};
+    for (const box of boxPriority) {
+      boxInventory[box.id] = items[box.id]?.quantity || 0;
+    }
+    log(tokenName, `箱子库存: 木质=${boxInventory[2001]}, 青铜=${boxInventory[2002]}, 黄金=${boxInventory[2003]}, 铂金=${boxInventory[2004]}`);
+
+    // 计算开箱方案：先用木质（保留200），再用高级箱凑齐
+    const boxToOpen = {};
+    let remainingPoints = targetPoints;
+
+    // 木质宝箱（保留 reserve 个）
+    const woodenAvailable = boxInventory[2001] - 200;
+    if (woodenAvailable >= 10) {
+      let woodenToOpen = Math.min(woodenAvailable, remainingPoints);
+      woodenToOpen = Math.floor(woodenToOpen / 10) * 10;
+      if (woodenToOpen >= 10) {
+        boxToOpen[2001] = woodenToOpen;
+        remainingPoints -= woodenToOpen * 1;
+      }
+    }
+
+    // 用高级箱填补剩余积分
+    if (remainingPoints > 0) {
+      for (const box of [boxPriority[3], boxPriority[2], boxPriority[1]]) { // 铂金→黄金→青铜
+        const avail = Math.floor(boxInventory[box.id] / 10) * 10;
+        if (avail <= 0 || remainingPoints <= 0) continue;
+        const needBoxes = Math.min(avail, Math.ceil(remainingPoints / box.points / 10) * 10);
+        if (needBoxes >= 10) {
+          boxToOpen[box.id] = needBoxes;
+          remainingPoints -= needBoxes * box.points;
+        }
+      }
+    }
+
+    if (remainingPoints > 0) {
+      // 用额外木质补齐
+      const extra = Math.ceil(remainingPoints / 10) * 10;
+      if (extra <= Math.floor(boxInventory[2001] / 10) * 10) {
+        boxToOpen[2001] = (boxToOpen[2001] || 0) + extra;
+        remainingPoints -= extra;
+      }
+    }
+
+    // 执行开箱
+    for (const box of boxPriority) {
+      const count = boxToOpen[box.id] || 0;
+      if (count <= 0) continue;
+      log(tokenName, `开启 ${box.name}: ${count} 个 (积分: ${count * box.points})`);
+      const batches = Math.floor(count / 10);
+      const remainder = count % 10;
+      for (let i = 0; i < batches; i++) {
+        await execCmd(client, tokenName, 'item_openbox', { itemId: box.id, number: 10 }, `${box.name} ${(i + 1) * 10}/${count}`);
+        await sleep(delay);
+      }
+      if (remainder > 0) {
+        await execCmd(client, tokenName, 'item_openbox', { itemId: box.id, number: remainder }, `${box.name} ${count}/${count}`);
+        await sleep(delay);
+      }
+    }
+    await execCmd(client, tokenName, 'item_batchclaimboxpointreward', {}, '领取宝箱积分奖励');
+    log(tokenName, `✅ 按积分开箱完成`, 'success');
+  } catch (err) { log(tokenName, `按积分开箱失败: ${err.message}`, 'warning'); }
+}
+
+/** 领取宝箱积分奖励 */
+async function runBatchClaimBoxPointReward(client, tokenName) {
+  await execCmd(client, tokenName, 'item_batchclaimboxpointreward', {}, '领取宝箱积分奖励');
+}
+
+/** 批量钓鱼 */
+async function runBatchFish(client, tokenName, batchSettings = {}, delay = 500) {
+  const fishType = batchSettings.defaultFishType ?? 1;
+  const totalCount = batchSettings.fishCount ?? 100;
+  const fishNames = { 1: '普通鱼竿', 2: '黄金鱼竿' };
+  const rodId = fishType === 1 ? 1011 : 1012;
+  log(tokenName, `批量钓鱼：${fishNames[fishType] || fishType} x ${totalCount}`);
+  try {
+    // 检查鱼竿库存
+    const roleRes = await client.sendWithPromise('role_getroleinfo', {}, 8000);
+    const rodCount = roleRes?.role?.items?.[rodId]?.quantity || 0;
+    let availableCount = totalCount;
+    if (rodCount < totalCount) {
+      log(tokenName, `鱼竿不足 (${rodCount} < ${totalCount})，将仅消耗现有库存`, 'warning');
+      availableCount = rodCount;
+    }
+    if (availableCount <= 0) {
+      log(tokenName, '没有可用的鱼竿，停止任务', 'warning');
+      return;
+    }
+    const batches = Math.floor(availableCount / 10);
+    const remainder = availableCount % 10;
+    for (let i = 0; i < batches; i++) {
+      await execCmd(client, tokenName, 'artifact_lottery', { type: fishType, lotteryNumber: 10, newFree: true }, `钓鱼 ${(i + 1) * 10}/${availableCount}`);
+      await sleep(delay);
+      // 每50次后校验鱼竿数量
+      if ((i + 1) % 5 === 0 && i < batches - 1) {
+        try {
+          const r = await client.sendWithPromise('role_getroleinfo', {}, 5000);
+          const currentRod = r?.role?.items?.[rodId]?.quantity || 0;
+          if (currentRod < 10) {
+            log(tokenName, `鱼竿不足 (${currentRod} < 10)，停止`, 'warning');
+            break;
+          }
+        } catch (_) {}
+      }
+    }
+    if (remainder > 0) {
+      await execCmd(client, tokenName, 'artifact_lottery', { type: fishType, lotteryNumber: remainder, newFree: true }, `钓鱼 ${availableCount}/${availableCount}`);
+    }
+    // 自动领取累计奖励
+    try {
+      const r = await client.sendWithPromise('role_getroleinfo', {}, 5000);
+      const points = r?.role?.statistics?.['artifact:point'] || 0;
+      const exchangeCount = Math.floor(points / 20);
+      if (exchangeCount > 0) {
+        log(tokenName, `检测到累计使用 ${points}，领取 ${exchangeCount} 次累计奖励`);
+        for (let k = 0; k < exchangeCount; k++) {
+          await execCmd(client, tokenName, 'artifact_exchange', {}, `领取累计奖励 ${k + 1}/${exchangeCount}`);
+          await sleep(500);
+        }
+      }
+    } catch (_) {}
+    log(tokenName, `✅ 批量钓鱼完成`, 'success');
+  } catch (err) { log(tokenName, `批量钓鱼失败: ${err.message}`, 'warning'); }
+}
+
+/** 批量招募 */
+async function runBatchRecruit(client, tokenName, batchSettings = {}, delay = 500) {
+  const totalCount = batchSettings.recruitCount ?? 100;
+  log(tokenName, `批量招募：${totalCount} 次`);
+  try {
+    const batches = Math.floor(totalCount / 10);
+    const remainder = totalCount % 10;
+    for (let i = 0; i < batches; i++) {
+      await execCmd(client, tokenName, 'hero_recruit', { recruitType: 1, recruitNumber: 10 }, `招募 ${(i + 1) * 10}/${totalCount}`);
+      await sleep(delay);
+    }
+    if (remainder > 0) {
+      await execCmd(client, tokenName, 'hero_recruit', { recruitType: 1, recruitNumber: remainder }, `招募 ${totalCount}/${totalCount}`);
+    }
+    log(tokenName, `✅ 批量招募完成`, 'success');
+  } catch (err) { log(tokenName, `批量招募失败: ${err.message}`, 'warning'); }
+}
+
+/** 批量赠送功法残卷 */
+async function runBatchLegacyGiftSend(client, tokenName, batchSettings = {}, delay = 500) {
+  const recipientId = Number(batchSettings.receiverId || 0);
+  const password = batchSettings.password || '';
+  if (!recipientId || recipientId <= 0) {
+    log(tokenName, '赠送功法：未配置接收者ID，跳过', 'warning');
+    return;
+  }
+  if (!password) {
+    log(tokenName, '赠送功法：未配置安全密码，跳过', 'warning');
+    return;
+  }
+  try {
+    // 1. 获取角色信息（检查功法残卷数量）
+    const roleRes = await client.sendWithPromise('role_getroleinfo', {}, 8000);
+    const quantity = Math.min(roleRes?.role?.items?.[37007]?.quantity || 0, 9999);
+    if (quantity <= 0) {
+      log(tokenName, '赠送功法：功法残卷不足（0个）', 'warning');
+      return;
+    }
+    // 2. 查询接收者信息
+    const rankRes = await client.sendWithPromise('rank_getroleinfo', {
+      bottleType: 0, includeBottleTeam: false, isSearch: false, roleId: recipientId,
+    }, 5000);
+    if (!rankRes?.roleInfo?.roleId) {
+      log(tokenName, `赠送功法：接收者 ${recipientId} 不存在`, 'error');
+      return;
+    }
+    const serverName = rankRes.roleInfo.serverName || '';
+    const targetName = rankRes.roleInfo.name || '';
+    log(tokenName, `赠送目标: [${serverName}] ID:${recipientId} ${targetName}，数量: ${quantity}`);
+
+    // 3. 解除安全密码
+    const pwdRes = await client.sendWithPromise('role_commitpassword', { password, passwordType: 1 }, 5000);
+    if (!pwdRes?.role?.statistics?.['que:wh:tm']) {
+      log(tokenName, '赠送功法：安全密码验证失败', 'error');
+      return;
+    }
+    log(tokenName, '安全密码验证成功');
+
+    // 4. 赠送
+    await client.sendWithPromise('legacy_sendgift', {
+      itemCnt: quantity, legacyUIds: [], targetId: recipientId,
+    }, 5000);
+    log(tokenName, `✅ 成功赠送功法残卷 ${quantity} 个给 [${serverName}] ${targetName}`, 'success');
+    await sleep(delay);
+  } catch (err) { log(tokenName, `赠送功法残卷失败: ${err.message}`, 'warning'); }
 }
 
 /** 一键收车 */
@@ -701,8 +1344,363 @@ async function runClaimCars(client, tokenName, delay = 500) {
   } catch (err) { log(tokenName, `收车失败: ${err.message}`, 'warning'); }
 }
 
-/** 任务类型 → 执行函数映射 */
+/** 钓鱼补齐（月度活动）- 补齐钓鱼进度至目标 320 次 */
+async function runTopUpFish(client, tokenName, delay = 500) {
+  const FISH_TARGET = 320;  // 月度钓鱼目标
+  try {
+    // 1. 获取月度活动进度
+    log(tokenName, '获取月度钓鱼进度...');
+    const actRes = await client.sendWithPromise('activity_get', {}, 10000);
+    const myMonthInfo = actRes?.activity?.myMonthInfo || {};
+    const currentFishNum = Number(myMonthInfo?.['2']?.num || 0);
+
+    log(tokenName, `当前钓鱼进度: ${currentFishNum}/${FISH_TARGET}`);
+
+    if (currentFishNum >= FISH_TARGET) {
+      log(tokenName, '✅ 钓鱼进度已达标，无需补齐', 'success');
+      return;
+    }
+
+    const need = FISH_TARGET - currentFishNum;
+    log(tokenName, `需要补齐: ${need}次钓鱼`);
+
+    // 2. 检查并消耗免费钓鱼次数（如果今天有）
+    let roleInfo = null;
+    try {
+      const roleRes = await client.sendWithPromise('role_getroleinfo', {}, 8000);
+      roleInfo = roleRes?.role || null;
+    } catch (e) {
+      log(tokenName, `获取角色信息失败: ${e.message}`, 'warning');
+    }
+
+    let freeUsed = 0;
+    if (roleInfo) {
+      const lastFreeTime = Number(roleInfo?.statisticsTime?.['artifact:normal:lottery:time'] || 0);
+      const now = new Date();
+      const lastFreeDate = new Date(lastFreeTime * 1000);
+      
+      // 判断是否今天还有免费钓鱼次数
+      if (now.toDateString() === lastFreeDate.toDateString()) {
+        log(tokenName, '✓ 今日免费钓鱼次数已使用，跳过', 'info');
+      } else {
+        log(tokenName, '检测到今日免费钓鱼次数，开始消耗 3 次');
+        for (let i = 0; i < 3 && freeUsed < need; i++) {
+          try {
+            await execCmd(client, tokenName, 'artifact_lottery', { lotteryNumber: 1, newFree: true, type: 1 }, `免费钓鱼 ${i+1}/3`);
+            freeUsed++;
+            await sleep(delay);
+          } catch (e) {
+            log(tokenName, `免费钓鱼失败: ${e.message}`, 'warning');
+            break;
+          }
+        }
+      }
+    }
+
+    const remainNeed = need - freeUsed;
+    if (remainNeed > 0) {
+      log(tokenName, `还需补齐 ${remainNeed}次，开始使用钓竿钓鱼`);
+      // 3. 使用普通钓竿补齐（需要消耗金币或其他资源）
+      for (let i = 0; i < remainNeed; i++) {
+        try {
+          await execCmd(client, tokenName, 'artifact_lottery', { lotteryNumber: 1, newFree: false, type: 1 }, `付费钓鱼 ${i+1}/${remainNeed}`);
+          await sleep(delay);
+        } catch (e) {
+          log(tokenName, `付费钓鱼${i+1}失败: ${e.message}`, 'warning');
+          break;
+        }
+      }
+    }
+
+    // 4. 验证最终进度
+    const finalRes = await client.sendWithPromise('activity_get', {}, 10000);
+    const finalMyMonthInfo = finalRes?.activity?.myMonthInfo || {};
+    const finalFishNum = Number(finalMyMonthInfo?.['2']?.num || 0);
+    log(tokenName, `✅ 钓鱼补齐完成，最终进度: ${finalFishNum}/${FISH_TARGET}`, 'success');
+  } catch (err) {
+    log(tokenName, `钓鱼补齐失败: ${err.message}`, 'error');
+  }
+}
+
+/** 竞技场补齐（月度活动）- 补齐竞技场进度至目标 240 次 */
+async function runTopUpArena(client, tokenName, batchSettings = {}, delay = 500) {
+  const ARENA_TARGET = 240;  // 月度竞技场目标
+  try {
+    // 1. 获取月度活动进度
+    log(tokenName, '获取月度竞技场进度...');
+    const actRes = await client.sendWithPromise('activity_get', {}, 10000);
+    const myMonthInfo = actRes?.activity?.myMonthInfo || {};
+    const currentArenaNum = Number(myMonthInfo?.['1']?.num || 0);
+
+    log(tokenName, `当前竞技场进度: ${currentArenaNum}/${ARENA_TARGET}`);
+
+    if (currentArenaNum >= ARENA_TARGET) {
+      log(tokenName, '✅ 竞技场进度已达标，无需补齐', 'success');
+      return;
+    }
+
+    const need = ARENA_TARGET - currentArenaNum;
+    log(tokenName, `需要补齐: ${need}次竞技场战斗`);
+
+    // 2. 获取 battleVersion（竞技场战斗必需）
+    const battleVersion = await getBattleVersion(client, tokenName);
+    if (!battleVersion) {
+      log(tokenName, '获取 battleVersion 失败，无法进行竞技场战斗', 'error');
+      return;
+    }
+
+    // 3. 获取竞技场阵容配置
+    const arenaFormation = batchSettings.arenaFormation ?? 1;
+    let currentFormation = null;
+    let switched = false;
+    
+    try {
+      const teamInfo = await client.sendWithPromise('presetteam_getinfo', {}, 5000);
+      currentFormation = teamInfo?.presetTeamInfo?.useTeamId ?? null;
+
+      if (currentFormation !== arenaFormation) {
+        await client.sendWithPromise('presetteam_saveteam', { teamId: arenaFormation }, 5000);
+        switched = true;
+        log(tokenName, `已切换到竞技场阵容 ${arenaFormation}`, 'info');
+      }
+    } catch (e) {
+      log(tokenName, `切换阵容失败: ${e.message}`, 'warning');
+    }
+
+    // 4. 循环进行竞技场战斗
+    let arenaCount = 0;
+    for (let i = 0; i < need && arenaCount < need; i++) {
+      try {
+        // 进入竞技场
+        await client.sendWithPromise('arena_startarea', {}, 5000).catch(() => {});
+        
+        // 获取目标
+        const targets = await client.sendWithPromise('arena_getareatarget', { refresh: false }, 5000);
+        const targetId = pickArenaTargetId(targets);
+        
+        if (!targetId) {
+          log(tokenName, `竞技场：未找到目标 ${i+1}/${need}`, 'warning');
+          break;
+        }
+
+        // 执行战斗
+        await execCmd(client, tokenName, 'fight_startareaarena', { battleVersion, targetId }, `竞技场补齐 ${i+1}/${need}`);
+        arenaCount++;
+        await sleep(delay);
+      } catch (e) {
+        log(tokenName, `竞技场战斗 ${i+1} 失败: ${e.message}`, 'warning');
+        if (arenaCount === 0) break;  // 如果第一场就失败则中止
+      }
+    }
+
+    // 5. 恢复原阵容
+    if (switched && currentFormation !== null) {
+      try {
+        await client.sendWithPromise('presetteam_saveteam', { teamId: currentFormation }, 5000);
+        log(tokenName, `已恢复原阵容 ${currentFormation}`, 'info');
+      } catch (e) {
+        log(tokenName, `恢复阵容失败: ${e.message}`, 'warning');
+      }
+    }
+
+    // 6. 验证最终进度
+    const finalRes = await client.sendWithPromise('activity_get', {}, 10000);
+    const finalMyMonthInfo = finalRes?.activity?.myMonthInfo || {};
+    const finalArenaNum = Number(finalMyMonthInfo?.['1']?.num || 0);
+    log(tokenName, `✅ 竞技场补齐完成，共补齐 ${arenaCount}次，最终进度: ${finalArenaNum}/${ARENA_TARGET}`, 'success');
+  } catch (err) {
+    log(tokenName, `竞技场补齐失败: ${err.message}`, 'error');
+  }
+}
+
+/**
+ * 武将升级至目标等级 - 自动处理升级和进阶
+ * 
+ * 进阶等级阈值（来自前端游戏逻辑）：
+ * - 100级 → order 1, 200级 → order 2, ... 5500级 → order 19
+ */
+const LEVEL_BREAKPOINTS = [
+  { level: 100, order: 1 },
+  { level: 200, order: 2 },
+  { level: 300, order: 3 },
+  { level: 500, order: 4 },
+  { level: 700, order: 5 },
+  { level: 900, order: 6 },
+  { level: 1100, order: 7 },
+  { level: 1300, order: 8 },
+  { level: 1500, order: 9 },
+  { level: 1800, order: 10 },
+  { level: 2100, order: 11 },
+  { level: 2400, order: 12 },
+  { level: 2800, order: 13 },
+  { level: 3200, order: 14 },
+  { level: 3600, order: 15 },
+  { level: 4000, order: 16 },
+  { level: 4500, order: 17 },
+  { level: 5000, order: 18 },
+  { level: 5500, order: 19 },
+];
+
+/**
+ * 判断升级过程中是否跨越进阶阈值
+ * @param {number} currentLevel - 现在等级
+ * @param {number} upgradeNum - 本次升级增量
+ * @param {number} currentOrder - 当前进阶等级
+ * @returns {number|false} 返回需要进阶的等级，若无则返回 false
+ */
+/**
+ * 找到当前等级到目标等级之间，下一个需要进阶的阈值等级
+ * @returns {{ level: number, order: number } | null}
+ */
+function getNextBreakpoint(currentLevel, currentOrder, target) {
+  for (const bp of LEVEL_BREAKPOINTS) {
+    if (bp.level > currentLevel && bp.level <= target && bp.order > currentOrder) {
+      return bp;
+    }
+  }
+  return null;
+}
+
+async function runHeroLevelUpgrade(client, tokenName, heroId, targetLevel = 6000, delay = 500) {
+  targetLevel = Math.min(Number(targetLevel), 6000);  // 最高 6000
+  
+  try {
+    // 1. 获取当前武将信息
+    log(tokenName, `准备升级武将 (heroId=${heroId}) 至等级 ${targetLevel}`);
+    
+    const roleRes = await client.sendWithPromise('role_getroleinfo', {}, 8000);
+    const hero = roleRes?.role?.heroes?.[heroId];
+    
+    if (!hero) {
+      log(tokenName, `❌ 武将 ${heroId} 不存在`, 'error');
+      return;
+    }
+
+    const currentLevel = hero.level || 0;
+    const currentOrder = hero.order || 0;
+    
+    log(tokenName, `当前等级: ${currentLevel}/${6000}, 进阶等级: ${currentOrder}`, 'info');
+
+    if (currentLevel >= targetLevel) {
+      log(tokenName, `✅ 武将已达目标等级 ${targetLevel}，无需升级`, 'success');
+      return;
+    }
+
+    // 2. 升级循环
+    let level = currentLevel;
+    let order = currentOrder;
+    let upgradeCount = 0;
+
+    while (level < targetLevel) {
+      // 先检查当前等级是否正好在进阶点上，如果是则先进阶
+      const atBreakpoint = LEVEL_BREAKPOINTS.find(b => b.level === level && b.order > order);
+      if (atBreakpoint) {
+        log(tokenName, `📈 到达进阶阈值 ${level} 级，执行进阶...`, 'info');
+        try {
+          const advRes = await client.sendWithPromise('hero_heroupgradeorder', { heroId }, 5000);
+          const newHero = advRes?.role?.heroes?.[heroId];
+          if (newHero) {
+            order = newHero.order || order;
+            log(tokenName, `✓ 进阶成功，当前进阶等级: ${order}`, 'info');
+          } else {
+            log(tokenName, `⚠️  进阶响应异常`, 'warning');
+          }
+        } catch (e) {
+          log(tokenName, `⚠️  进阶失败: ${e.message}`, 'warning');
+          break;
+        }
+        await sleep(delay);
+        continue;
+      }
+
+      // 计算本次升级的步长：不能越过下一个进阶点
+      const nextBp = getNextBreakpoint(level, order, targetLevel);
+      let stepTarget;
+
+      if (nextBp && nextBp.level <= level + 50) {
+        stepTarget = nextBp.level;
+      } else {
+        stepTarget = Math.min(level + 50, targetLevel);
+      }
+
+      const need = stepTarget - level;
+
+      if (need <= 0) {
+        break;
+      }
+
+      // 将 need 拆解为合法步长 [50, 10, 5, 1] 的组合
+      const VALID_STEPS = [50, 10, 5, 1];
+      const steps = [];
+      let remaining = need;
+      for (const s of VALID_STEPS) {
+        while (remaining >= s) {
+          steps.push(s);
+          remaining -= s;
+        }
+      }
+
+      log(tokenName, `升级中... ${upgradeCount + 1} (当前 ${level}→${stepTarget}，升${need}级，分${steps.length}步)`);
+
+      let stepFailed = false;
+      for (const step of steps) {
+        try {
+          const upgradeRes = await client.sendWithPromise(
+            'hero_heroupgradelevel',
+            { heroId, upgradeNum: step },
+            5000
+          );
+          const newHero = upgradeRes?.role?.heroes?.[heroId];
+          if (newHero) {
+            level = newHero.level || level;
+            order = newHero.order || order;
+          }
+          await sleep(200);
+        } catch (e) {
+          log(tokenName, `升级失败(+${step}): ${e.message}`, 'error');
+          stepFailed = true;
+          break;
+        }
+      }
+
+      if (stepFailed) break;
+
+      upgradeCount++;
+      log(tokenName, `✓ 升级成功，当前等级: ${level}/${6000}，进阶: ${order}`, 'info');
+      
+      await sleep(delay);
+    }
+
+    // 3. 最终验证
+    try {
+      const finalRes = await client.sendWithPromise('role_getroleinfo', {}, 8000);
+      const finalHero = finalRes?.role?.heroes?.[heroId];
+      if (finalHero) {
+        level = finalHero.level || level;
+        order = finalHero.order || order;
+      }
+    } catch (e) {
+      log(tokenName, `最终验证失败: ${e.message}`, 'warning');
+    }
+
+    log(tokenName, `✅ 武将升级完成，共升级 ${upgradeCount}次，最终等级: ${level}/${6000}，进阶: ${order}`, 'success');
+
+  } catch (err) {
+    log(tokenName, `武将升级失败: ${err.message}`, 'error');
+  }
+}
+
+/** 任务类型 → 执行函数映射
+ * 延迟类型说明（对齐前端 delayConfig）：
+ *   commandDelay: 通用命令间延迟（默认500ms）
+ *   actionDelay:  开箱/钓鱼/招募等操作延迟（默认300ms）
+ *   battleDelay:  竞技场/爬塔/宝库等战斗延迟（默认500ms）
+ *   refreshDelay: 发车刷新等延迟（默认1000ms）
+ *   longDelay:    功法赠送等长延迟（默认3000ms）
+ *   taskDelay:    任务间延迟（在 main 循环中使用，默认500ms）
+ */
 const TASK_RUNNERS = {
+  // ── 日常（commandDelay）──
   startBatch:               (c, n, s) => runDailyBasic(c, n, s.commandDelay),
   claimHangUpRewards:       (c, n)    => runClaimHangUp(c, n),
   batchclubsign:            (c, n)    => runClubSign(c, n),
@@ -712,24 +1710,38 @@ const TASK_RUNNERS = {
   batchlingguanzi:          (c, n)    => runClaimBottle(c, n),
   batchLegacyClaim:         (c, n)    => runLegacyClaim(c, n),
   batchAddHangUpTime:       (c, n, s) => runAddHangUpTime(c, n, s.commandDelay),
-  batcharenafight:          (c, n, s) => runArenaFight(c, n, s, s.commandDelay),
   store_purchase:           (c, n)    => runStorePurchase(c, n),
   legion_storebuygoods:     (c, n)    => runLegionStoreBuyGoods(c, n),
   batchmengjing:            (c, n, s) => runBatchMengjing(c, n, s.commandDelay),
-  skinChallenge:            (c, n, s) => runSkinChallenge(c, n, s.commandDelay),
-  batchGenieSweep:          (c, n, s) => runGenieSweep(c, n, s.commandDelay),
   batchStudy:               (c, n)    => runBatchStudy(c, n),
-  batchbaoku13:             (c, n, s) => runBaoku13(c, n, s.commandDelay),
-  batchbaoku45:             (c, n, s) => runBaoku45(c, n, s.commandDelay),
-  climbTower:               (c, n, s) => runClimbTower(c, n, s.commandDelay),
-  climbWeirdTower:          (c, n, s) => runClimbWeirdTower(c, n, s.commandDelay),
-  batchClaimFreeEnergy:     (c, n)    => runClaimFreeEnergy(c, n),
-  batchUseItems:            (c, n, s) => runUseItems(c, n, s.commandDelay),
-  batchMergeItems:          (c, n, s) => runMergeItems(c, n, s.commandDelay),
   batchClaimPeachTasks:     (c, n, s) => runClaimPeachTasks(c, n, s.commandDelay),
-  batchBuyDreamItems:       (c, n, s) => runBuyDreamItems(c, n, s, s.commandDelay),
-  batchSmartSendCar:        (c, n, s) => runSmartSendCar(c, n, s.commandDelay),
+  // ── 战斗类（battleDelay）──
+  batcharenafight:          (c, n, s) => runArenaFight(c, n, s, s.battleDelay || s.commandDelay),
+  climbTower:               (c, n, s) => runClimbTower(c, n, s.battleDelay || s.commandDelay),
+  climbWeirdTower:          (c, n, s) => runClimbWeirdTower(c, n, s.battleDelay || s.commandDelay),
+  batchbaoku13:             (c, n, s) => runBaoku13(c, n, s.battleDelay || s.commandDelay),
+  batchbaoku45:             (c, n, s) => runBaoku45(c, n, s.battleDelay || s.commandDelay),
+  skinChallenge:            (c, n, s) => runSkinChallenge(c, n, s.battleDelay || s.commandDelay),
+  batchTopUpArena:          (c, n, s) => runTopUpArena(c, n, s, s.battleDelay || s.commandDelay),
+  // ── 操作类（actionDelay）──
+  batchOpenBox:             (c, n, s) => runBatchOpenBox(c, n, s, s.actionDelay || s.commandDelay),
+  batchOpenBoxByPoints:     (c, n, s) => runBatchOpenBoxByPoints(c, n, s, s.actionDelay || s.commandDelay),
+  batchClaimBoxPointReward: (c, n)    => runBatchClaimBoxPointReward(c, n),
+  batchFish:                (c, n, s) => runBatchFish(c, n, s, s.actionDelay || s.commandDelay),
+  batchRecruit:             (c, n, s) => runBatchRecruit(c, n, s, s.actionDelay || s.commandDelay),
+  batchUseItems:            (c, n, s) => runUseItems(c, n, s.actionDelay || s.commandDelay),
+  batchMergeItems:          (c, n, s) => runMergeItems(c, n, s.actionDelay || s.commandDelay),
+  batchClaimFreeEnergy:     (c, n)    => runClaimFreeEnergy(c, n),
+  // ── 刷新类（refreshDelay）──
+  batchSmartSendCar:        (c, n, s) => runSmartSendCar(c, n, s, s.refreshDelay || s.commandDelay),
   batchClaimCars:           (c, n, s) => runClaimCars(c, n, s.commandDelay),
+  batchGenieSweep:          (c, n, s) => runGenieSweep(c, n, s.refreshDelay || s.commandDelay),
+  batchTopUpFish:           (c, n, s) => runTopUpFish(c, n, s.commandDelay),
+  // ── 长延迟（longDelay）──
+  batchBuyDreamItems:       (c, n, s) => runBuyDreamItems(c, n, s, s.longDelay || s.commandDelay),
+  batchLegacyGiftSendEnhanced: (c, n, s) => runBatchLegacyGiftSend(c, n, s, s.longDelay || s.commandDelay),
+  // ── 工具 ──
+  batchHeroLevelUpgrade:    (c, n, s) => runHeroLevelUpgrade(c, n, s.heroId, s.targetLevel, s.commandDelay),
 };
 
 // ============================================================
@@ -749,8 +1761,8 @@ async function main() {
     process.exit(1);
   }
 
-  const { name: taskName, selectedTokens = [], selectedTasks = [], batchSettings = {} } = task;
-  const delay = batchSettings.commandDelay ?? 500;
+  const { name: taskName, selectedTokens = [], selectedTasks = [], batchSettings = {}, tokenSettings = {} } = task;
+  const taskDelay = batchSettings.taskDelay ?? batchSettings.commandDelay ?? 500;
   const tokens = loadTokens();
 
   if (Object.keys(tokens).length === 0) {
@@ -774,34 +1786,60 @@ async function main() {
       continue;
     }
 
+    // 合并 per-token 设置（如 arenaFormation）到 batchSettings
+    const perTokenSettings = tokenSettings[tokenId] || {};
+    const mergedSettings = { ...batchSettings };
+    // per-token 设置覆盖全局设置（仅覆盖 per-token 特有的字段）
+    if (perTokenSettings.arenaFormation != null) mergedSettings.arenaFormation = perTokenSettings.arenaFormation;
+    if (perTokenSettings.towerFormation != null) mergedSettings.towerFormation = perTokenSettings.towerFormation;
+    if (perTokenSettings.bossFormation != null) mergedSettings.bossFormation = perTokenSettings.bossFormation;
+
     const client = new GameClient({
       log: (msg, level) => log(tokenName, msg, level),
     });
 
     try {
       // bin 导入的 token 含过期 session，连接前先刷新
-      let activeToken = tokenStr;
-      if (tokenData.importMethod === 'bin') {
-        const fresh = await refreshTokenFromBin(tokenId, tokenName);
-        if (fresh) activeToken = fresh;
-      }
+      let activeToken = await buildFreshActiveToken(tokenData, tokenId, tokenName, tokenStr);
+      const getFreshActiveToken = async () => {
+        activeToken = await buildFreshActiveToken(tokenData, tokenId, tokenName, activeToken);
+        return activeToken;
+      };
+
       await client.connect(activeToken);
       log(tokenName, '连接成功');
 
+      // 全局包一层：所有 sendWithPromise 都具备“自动重连 + 重试”能力
+      applyResilientSendWrapper(client, tokenName, getFreshActiveToken, 3);
+
+      // 在每个任务开始前检查连接（sendWithPromise 内也有二次兜底）
+      let checkedTasksCount = 0;
       for (const taskType of selectedTasks) {
         const runner = TASK_RUNNERS[taskType];
         if (!runner) {
           log(tokenName, `不支持的任务类型: ${taskType}（需在 run_task.js 中补充）`, 'warning');
           continue;
         }
+        
+        const connected = await ensureConnected(client, tokenName, getFreshActiveToken, 3);
+        if (!connected) {
+          log(taskName, `[${taskType}] 跳过：连接失败`, 'error');
+          checkedTasksCount++;
+          continue;
+        }
+        checkedTasksCount++;
+        
         log(tokenName, `执行任务: ${taskType}`);
-        await runner(client, tokenName, batchSettings);
-        await sleep(delay);
+        await runner(client, tokenName, mergedSettings);
+        await sleep(taskDelay);  // 使用 taskDelay 作为任务间延迟
       }
     } catch (err) {
       log(tokenName, `执行失败: ${err.message}`, 'error');
     } finally {
       client.disconnect();
+      // ✅ 顺序执行：每个token完成后等待 2 秒，再执行下一个token
+      // 这样可以避免同时大量连接导致被游戏服务器重置
+      await sleep(2000);
     }
   }
 

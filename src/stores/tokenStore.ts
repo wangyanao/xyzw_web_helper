@@ -306,6 +306,9 @@ export const useTokenStore = defineStore("tokens", () => {
     // 同时删除IndexedDB中的数据
     await deleteArrayBuffer(tokenId);
 
+    // 通知服务端删除该 token（合并模式下 sync 不再自动删除）
+    fetch(`/api/tokens/${encodeURIComponent(tokenId)}`, { method: 'DELETE' }).catch(() => {});
+
     syncTokensToServer();
     return true;
   };

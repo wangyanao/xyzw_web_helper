@@ -213,9 +213,19 @@ import { ref, computed, watch, onMounted, onUnmounted } from "vue";
 import { useMessage, NCard, NThing, NAvatar, NSpace, NButton, NTag, NGrid, NGi, NIcon, NModal, NSelect, NSpin, NEmpty, NStatistic } from "naive-ui";
 import { useTokenStore } from "@/stores/tokenStore";
 import { CarSport, Refresh, Flash, ArrowUpCircle, Person, Ticket } from "@vicons/ionicons5";
+import { shouldSendCar as _shouldSendCar } from "@/utils/batch/carUtils";
 
 const tokenStore = useTokenStore();
 const message = useMessage();
+
+// 读取批量日常页面保存的 batchSettings（localStorage 共享）
+const loadBatchSettings = () => {
+  try {
+    const saved = localStorage.getItem('batchSettings');
+    if (saved) return JSON.parse(saved);
+  } catch {}
+  return {};
+};
 
 const carLoading = ref(false);
 const carRaw = ref(null);
@@ -541,15 +551,18 @@ const countRacingRefreshTickets = (rewards) => {
 };
 
 const shouldSendCar = (car, tickets) => {
-  const color = Number(car?.color || 0);
-  const rewards = Array.isArray(car?.rewards) ? car.rewards : [];
-  const racingTickets = countRacingRefreshTickets(rewards);
-  if (tickets >= 6) {
-    return (
-      color >= 4 && (color >= 5 || racingTickets >= 4 || isBigPrize(rewards))
-    );
-  }
-  return color >= 4 || racingTickets >= 2 || isBigPrize(rewards);
+  const settings = loadBatchSettings();
+  const minColor = settings.carMinColor ?? 4;
+  const useGoldRefreshFallback = settings.useGoldRefreshFallback ?? false;
+  const matchAll = settings.smartDepartureMatchAll ?? false;
+  const customConditions = {
+    gold: settings.smartDepartureGoldThreshold ?? 0,
+    recruit: settings.smartDepartureRecruitThreshold ?? 0,
+    jade: settings.smartDepartureJadeThreshold ?? 0,
+    ticket: settings.smartDepartureTicketThreshold ?? 0,
+  };
+  const effectiveTickets = useGoldRefreshFallback ? 999 : tickets;
+  return _shouldSendCar(car, effectiveTickets, minColor, customConditions, useGoldRefreshFallback, matchAll);
 };
 
 const fetchCarInfo = async () => {
@@ -951,11 +964,15 @@ const smartSendCar = async () => {
         await new Promise((r) => setTimeout(r, 500));
         continue;
       }
+      const settings = loadBatchSettings();
+      const useGoldFallback = settings.useGoldRefreshFallback ?? false;
       let shouldRefresh = false;
       const free = Number(car.refreshCount ?? 0) === 0;
       if (tickets >= 6) shouldRefresh = true;
       else if (free) shouldRefresh = true;
-      else {
+      else if (useGoldFallback) {
+        shouldRefresh = true;
+      } else {
         await assignHelperIfNeeded(car);
         await sendCar(car);
         await new Promise((r) => setTimeout(r, 500));
@@ -973,7 +990,9 @@ const smartSendCar = async () => {
         const freeNow = Number(car.refreshCount ?? 0) === 0;
         if (tickets >= 6) shouldRefresh = true;
         else if (freeNow) shouldRefresh = true;
-        else {
+        else if (useGoldFallback) {
+          shouldRefresh = true;
+        } else {
           await assignHelperIfNeeded(car);
           await sendCar(car);
           await new Promise((r) => setTimeout(r, 500));

@@ -220,6 +220,20 @@ export class GameClient {
 
   connect(tokenJson) {
     return new Promise((resolve, reject) => {
+      if (this._ws) {
+        try {
+          this._ws.onopen = null;
+          this._ws.onmessage = null;
+          this._ws.onclose = null;
+          this._ws.onerror = null;
+          this._ws.close();
+        } catch {}
+      }
+
+      this._ack = 0;
+      this._seq = 1;
+      this._stopHeartbeat();
+
       const url = `wss://xxz-xyzw.hortorgames.com/agent?p=${encodeURIComponent(tokenJson)}&e=x&lang=chinese`;
       this.log(`连接游戏服务器...`);
       const ws = new WebSocket(url);
@@ -229,6 +243,7 @@ export class GameClient {
       const timer = setTimeout(() => reject(new Error('连接超时')), 15000);
 
       ws.on('open', () => {
+        if (this._ws !== ws) return;
         clearTimeout(timer);
         this._connected = true;
         this.log('已连接');
@@ -236,11 +251,16 @@ export class GameClient {
         resolve();
       });
 
-      ws.on('message', (data) => this._onMessage(data));
+      ws.on('message', (data) => {
+        if (this._ws !== ws) return;
+        this._onMessage(data);
+      });
 
       ws.on('close', (code) => {
+        if (this._ws !== ws) return;
         this._connected = false;
         this._stopHeartbeat();
+        this._ws = null;
         this.log(`连接已断开: ${code}`);
         for (const [, { reject: rej, timeoutId }] of this._pending) {
           clearTimeout(timeoutId); rej(new Error('连接已断开'));
@@ -249,6 +269,7 @@ export class GameClient {
       });
 
       ws.on('error', (err) => {
+        if (this._ws !== ws) return;
         clearTimeout(timer);
         this.log(`连接错误: ${err.message}`, 'error');
         if (!this._connected) reject(err);
@@ -295,7 +316,10 @@ export class GameClient {
    */
   sendWithPromise(cmd, params = {}, timeout = 10000) {
     return new Promise((resolve, reject) => {
-      if (!this._connected) { reject(new Error('未连接')); return; }
+      if (!this._connected || !this._ws || this._ws.readyState !== WebSocket.OPEN) {
+        reject(new Error('未连接'));
+        return;
+      }
 
       const seq = this._seq++;
       // body 先 BON 编码（不加密），作为外层消息的 body 字段（binary tag 7）
@@ -309,15 +333,21 @@ export class GameClient {
       }, timeout);
 
       this._pending.set(seq, { resolve, reject, timeoutId });
-      this._ws.send(Buffer.from(data));
+      this._ws.send(Buffer.from(data), (err) => {
+        if (err) {
+          clearTimeout(timeoutId);
+          this._pending.delete(seq);
+          reject(err);
+        }
+      });
     });
   }
 
   _startHeartbeat() {
     this._heartbeatTimer = setInterval(() => {
-      if (!this._connected) return;
+      if (!this._connected || !this._ws || this._ws.readyState !== WebSocket.OPEN) return;
       const outer = { cmd: '_sys/ack', ack: this._ack, seq: 0, time: Date.now(), body: {} };
-      this._ws.send(Buffer.from(encryptX(bon.encode(outer))));
+      this._ws.send(Buffer.from(encryptX(bon.encode(outer))), () => {});
     }, 5000);
   }
 
@@ -327,8 +357,18 @@ export class GameClient {
 
   disconnect() {
     this._stopHeartbeat();
-    if (this._ws) { this._ws.close(); this._ws = null; }
+    if (this._ws) {
+      try {
+        this._ws.onopen = null;
+        this._ws.onmessage = null;
+        this._ws.onclose = null;
+        this._ws.onerror = null;
+        this._ws.close();
+      } catch {}
+      this._ws = null;
+    }
     this._connected = false;
+    this._ack = 0;
   }
 }
 

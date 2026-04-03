@@ -562,12 +562,12 @@ def _fire_task(task_id):
             stderr=subprocess.STDOUT,
         )
         task_json = json.dumps(task, ensure_ascii=False).encode('utf-8')
-        stdout, _ = proc.communicate(input=task_json, timeout=600)
+        stdout, _ = proc.communicate(input=task_json, timeout=1800)
         print(stdout.decode('utf-8', errors='replace'))
         print(f'[scheduler] 任务 {task["name"]} 执行完毕，退出码: {proc.returncode}')
     except subprocess.TimeoutExpired:
         proc.kill()
-        print(f'[scheduler] 任务 {task["name"]} 超时（10分钟）已终止')
+        print(f'[scheduler] 任务 {task["name"]} 超时（30分钟）已终止')
     except Exception as e:
         print(f'[scheduler] 任务 {task["name"]} 启动失败: {e}')
 
@@ -674,13 +674,15 @@ def trigger_task(task_id):
 def sync_tokens():
     """
     前端同步 token 数据到服务器（供定时任务使用）
+    采用合并模式：只新增/更新传入的 token，不删除已有 token。
+    避免多浏览器/多用户场景下互相覆盖。
     Body: { tokenId: { id, name, token, server }, ... }
     """
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({'error': '请求体必须是 JSON 对象'}), 400
 
-    # 只保存必要字段，不存敏感信息明文（但 token 本身已是 Base64/JSON 格式）
+    # 只保存必要字段
     safe = {}
     for tid, tdata in data.items():
         safe[tid] = {
@@ -691,18 +693,26 @@ def sync_tokens():
             'importMethod': tdata.get('importMethod', 'manual'),
         }
 
-    # 空列表 = 新浏览器/清缓存，不代表所有 token 已删除，直接跳过避免误清数据
     if not safe:
         return jsonify({'success': True, 'count': 0})
 
-    save_tokens(safe)
-
-    # 注意：不在此处清理 assignedTokenIds。
-    # sync 请求来自单个浏览器，其 token 列表是该用户的子集，
-    # 用它来裁剪其他用户的 assignedTokenIds 会导致误删。
-    # 清理在管理员查看用户列表时按需进行。
+    # 合并模式：读取已有 token，用传入数据更新/新增，保留未传入的 token
+    existing = load_tokens()
+    existing.update(safe)
+    save_tokens(existing)
 
     return jsonify({'success': True, 'count': len(safe)})
+
+
+@app.route('/api/tokens/<token_id>', methods=['DELETE'])
+def delete_token(token_id):
+    """从服务端 tokens.json 中删除指定 token"""
+    tokens = load_tokens()
+    if token_id not in tokens:
+        return jsonify({'success': True, 'deleted': False})
+    del tokens[token_id]
+    save_tokens(tokens)
+    return jsonify({'success': True, 'deleted': True})
 
 
 @app.route('/api/tokens', methods=['GET'])

@@ -3060,8 +3060,20 @@ const saveScheduledTasksLocal = () => {
 // 将定时任务同步到服务端 APScheduler
 const syncTasksToServer = async (tasks) => {
   try {
-    // 每个任务附带当前 batchSettings（服务端执行时需要 dreamPurchaseList 等配置）
-    const tasksWithSettings = tasks.map(t => ({ ...t, batchSettings: { ...batchSettings } }));
+    // 收集每个 token 的 per-token 设置（如 arenaFormation 等），供服务端使用
+    const tokenSettingsMap = {};
+    tokens.value.forEach((token) => {
+      const raw = localStorage.getItem(`daily-settings:${token.id}`);
+      if (raw) {
+        try { tokenSettingsMap[token.id] = JSON.parse(raw); } catch (_) {}
+      }
+    });
+    // 每个任务附带当前 batchSettings 和 tokenSettings
+    const tasksWithSettings = tasks.map(t => ({
+      ...t,
+      batchSettings: { ...batchSettings },
+      tokenSettings: tokenSettingsMap,
+    }));
     const res = await fetch("/api/tasks/sync", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

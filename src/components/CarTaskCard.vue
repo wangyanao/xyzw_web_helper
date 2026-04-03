@@ -82,6 +82,16 @@
 import { ref, computed, watch, onMounted } from "vue";
 import { useTokenStore } from "@/stores/tokenStore";
 import { g_utils } from "@/utils/bonProtocol.js";
+import { shouldSendCar as _shouldSendCarFull } from "@/utils/batch/carUtils";
+
+// 读取批量日常页面保存的 batchSettings
+const loadBatchSettings = () => {
+  try {
+    const saved = localStorage.getItem('batchSettings');
+    if (saved) return JSON.parse(saved);
+  } catch {}
+  return {};
+};
 
 // 车辆数据处理工具函数
 // 根据color值返回颜色名称
@@ -463,29 +473,20 @@ const countRacingRefreshTickets = (rewards) => {
   return count;
 };
 
-// 判断车辆是否符合发车条件
+// 判断车辆是否符合发车条件（读取 batchSettings 配置）
 const shouldSendCar = (carInfo, refreshTickets) => {
-  const color = carInfo.color || 0;
-  const rewards = carInfo.rewards || [];
-
-  // 计算奖励中的赛车刷新券数量
-  const racingTicketsCount = countRacingRefreshTickets(rewards);
-
-  // 如果刷新券充足（>=6），寻找神话以上|赛车刷新券>=4|大奖车
-  if (refreshTickets >= 6) {
-    return (
-      color >= 5 || // 神话以上
-      racingTicketsCount >= 4 || // 赛车刷新券>=4
-      isBigPrize(rewards)
-    ); // 大奖车
-  } else {
-    // 刷新券不足，寻找传说以上|赛车刷新券>=2|大奖车
-    return (
-      color >= 4 || // 传说以上
-      racingTicketsCount >= 2 || // 赛车刷新券>=2
-      isBigPrize(rewards)
-    ); // 大奖车
-  }
+  const settings = loadBatchSettings();
+  const minColor = settings.carMinColor ?? 4;
+  const useGoldRefreshFallback = settings.useGoldRefreshFallback ?? false;
+  const matchAll = settings.smartDepartureMatchAll ?? false;
+  const customConditions = {
+    gold: settings.smartDepartureGoldThreshold ?? 0,
+    recruit: settings.smartDepartureRecruitThreshold ?? 0,
+    jade: settings.smartDepartureJadeThreshold ?? 0,
+    ticket: settings.smartDepartureTicketThreshold ?? 0,
+  };
+  const effectiveTickets = useGoldRefreshFallback ? 999 : refreshTickets;
+  return _shouldSendCarFull(carInfo, effectiveTickets, minColor, customConditions, useGoldRefreshFallback, matchAll);
 };
 
 // 智能发车方法
@@ -524,30 +525,24 @@ const smartSendCar = async () => {
             continue;
           }
 
-          // 获取当前车辆的刷新次数
-          const refreshCount = car.refreshCount || 0;
-
           // 判断是否应该刷新这辆车
           let shouldRefresh = false;
           let remainingTickets = refreshTickets;
+          const settings = loadBatchSettings();
+          const useGoldFallback = settings.useGoldRefreshFallback ?? false;
 
           if (refreshTickets >= 6) {
-            // 刷新券充足时：使用刷新券寻找神话以上|赛车刷新券>=4|大奖车
-            console.log(
-              `💎 刷新券充足，使用刷新券刷新该车辆 (当前刷新券: ${refreshTickets})`,
-            );
             shouldRefresh = true;
           } else {
-            // 刷新券不足时
+            const refreshCount = car.refreshCount || 0;
             if (refreshCount === 0) {
-              // 有免费刷新：使用免费刷新寻找传说以上|赛车刷新券>=2|大奖车
-              console.log("🎯 刷新券不足，使用免费刷新寻找传说以上车辆");
+              shouldRefresh = true;
+            } else if (useGoldFallback) {
               shouldRefresh = true;
             } else {
-              // 没有免费刷新且刷新券不足，直接发车
               console.log("🔄 没有免费刷新且刷新券不足，直接发车");
               await sendCar(car.id);
-              await new Promise((resolve) => setTimeout(resolve, 500)); // 发车后延迟
+              await new Promise((resolve) => setTimeout(resolve, 500));
               continue;
             }
           }
@@ -595,17 +590,12 @@ const smartSendCar = async () => {
               // 检查是否可以继续刷新
               const newRefreshCount = updatedCar.refreshCount || 0;
               if (remainingTickets >= 6) {
-                // 刷新券充足，继续使用刷新券
-                console.log(
-                  `💎 继续使用刷新券刷新该车辆 (当前刷新券: ${remainingTickets})`,
-                );
                 shouldRefresh = true;
               } else if (newRefreshCount === 0) {
-                // 刷新券不足，但可以继续免费刷新
-                console.log("🎯 该车辆可以继续免费刷新");
+                shouldRefresh = true;
+              } else if (useGoldFallback) {
                 shouldRefresh = true;
               } else {
-                // 没有免费刷新且刷新券不足，直接发车
                 console.log("🔄 没有免费刷新且刷新券不足，直接发车");
                 await sendCar(updatedCar.id);
                 await new Promise((resolve) => setTimeout(resolve, 500)); // 发车后延迟

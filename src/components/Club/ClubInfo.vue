@@ -436,6 +436,7 @@
           </div>
         </div>
       </div>
+
     </div>
     <template #footer>
       <n-button @click="showPlayerInfoModal = false">关闭</n-button>
@@ -498,6 +499,26 @@
           <n-descriptions-item label="四圣等级" v-if="heroModealTemp.HolyBeast">
             {{ heroModealTemp.HBlevel }}
           </n-descriptions-item>
+          <n-descriptions-item label="四圣技能" v-if="heroModealTemp.HolyBeast && heroModealTemp.hBData">
+            <span
+              v-for="(unlocked, idx) in [
+                heroModealTemp.hBData.skill1,
+                heroModealTemp.hBData.skill2,
+                heroModealTemp.hBData.skill3,
+              ]"
+              :key="idx"
+              class="hb-skill-dot"
+              :class="unlocked ? 'hb-skill-on' : 'hb-skill-off'"
+            />
+          </n-descriptions-item>
+          <n-descriptions-item label="四圣属性" v-if="heroModealTemp.HolyBeast && heroModealTemp.hBData">
+            <span class="hb-attr">攻+{{ heroModealTemp.hBData.attack ?? 0 }}</span>
+            <span class="hb-attr">血+{{ heroModealTemp.hBData.hp ?? 0 }}</span>
+            <span class="hb-attr">速+{{ heroModealTemp.hBData.speed ?? 0 }}</span>
+          </n-descriptions-item>
+          <n-descriptions-item label="四圣公丹" v-if="heroModealTemp.HolyBeast && heroModealTemp.hBData">
+            {{ heroModealTemp.hBData.up ?? 0 }}
+          </n-descriptions-item>
           <n-descriptions-item label="鱼灵">
             {{
               heroModealTemp?.PearlInfo?.FishInfo?.name != undefined
@@ -528,58 +549,45 @@
 
       <div class="hero-modal-equipment">
         <h4 class="section-title">装备详情</h4>
+        <div class="quench-summary" v-if="heroModealTemp?.equipment">
+          满红孔统计: {{ getFullRedSummary(heroModealTemp.equipment).fullRedEquipCount }}/4（红孔
+          {{ getFullRedSummary(heroModealTemp.equipment).redHoles }}/{{
+            getFullRedSummary(heroModealTemp.equipment).totalHoles
+          }}）
+        </div>
         <div class="equipment-grid">
-          <div class="equipment-item">
-            <span class="equipment-label">武器:</span>
-            <div class="equipment-slots">
-              <div
-                v-for="(item, idx) in Object.values(
-                  Object.values(heroModealTemp.equipment)[0]?.quenches || {},
-                )"
-                :key="idx"
-                class="equipment-slot"
-                :class="{ 'red-slot': item.colorId === 6 }"
-              ></div>
+          <div
+            v-for="equip in getEquipmentEntries(heroModealTemp?.equipment)"
+            :key="equip.name"
+            class="equipment-item"
+          >
+            <div class="equipment-topline">
+              <span class="equipment-label">{{ equip.name }}:</span>
+              <div class="equipment-slots">
+                <div
+                  v-for="slot in equip.quenches"
+                  :key="`${equip.name}-${slot.slotId}`"
+                  class="equipment-slot"
+                  :class="{ 'red-slot': slot.colorId === 6 }"
+                ></div>
+              </div>
             </div>
-          </div>
-          <div class="equipment-item">
-            <span class="equipment-label">衣服:</span>
-            <div class="equipment-slots">
+            <div v-if="equip.quenches.length > 0" class="quench-list">
               <div
-                v-for="(item, idx) in Object.values(
-                  Object.values(heroModealTemp.equipment)[1]?.quenches || {},
-                )"
-                :key="idx"
-                class="equipment-slot"
-                :class="{ 'red-slot': item.colorId === 6 }"
-              ></div>
+                v-for="slot in equip.quenches"
+                :key="`${equip.name}-detail-${slot.slotId}`"
+                class="quench-row"
+              >
+                <span class="quench-slot">孔{{ slot.slotId || slot.displayIndex }}</span>
+                <span class="quench-lock" :class="{ locked: slot.isLocked }">
+                  {{ slot.isLocked ? "已锁" : "未锁" }}
+                </span>
+                <span class="quench-attr">{{ getQuenchAttrName(slot.attrId) }}</span>
+                <span class="quench-value">+{{ formatQuenchValue(slot.attrNum) }}</span>
+                <span class="quench-color">{{ getQuenchColorName(slot.colorId) }}（{{ slot.colorId }}）</span>
+              </div>
             </div>
-          </div>
-          <div class="equipment-item">
-            <span class="equipment-label">头盔:</span>
-            <div class="equipment-slots">
-              <div
-                v-for="(item, idx) in Object.values(
-                  Object.values(heroModealTemp.equipment)[2]?.quenches || {},
-                )"
-                :key="idx"
-                class="equipment-slot"
-                :class="{ 'red-slot': item.colorId === 6 }"
-              ></div>
-            </div>
-          </div>
-          <div class="equipment-item">
-            <span class="equipment-label">坐骑:</span>
-            <div class="equipment-slots">
-              <div
-                v-for="(item, idx) in Object.values(
-                  Object.values(heroModealTemp.equipment)[3]?.quenches || {},
-                )"
-                :key="idx"
-                class="equipment-slot"
-                :class="{ 'red-slot': item.colorId === 6 }"
-              ></div>
-            </div>
+            <div v-else class="quench-empty">无洗炼数据</div>
           </div>
         </div>
       </div>
@@ -603,6 +611,94 @@ import { $emit } from "@/stores/events";
 import { HERO_DICT, legacycolor, HeroFillInfo, getLineupType, LINEUP_RULES } from "@/utils/HeroList";
 import html2canvas from 'html2canvas';
 import { downloadCanvasAsImage } from "@/utils/imageExport";
+
+const QUENCH_ATTR_MAP = {
+  1: "攻击",
+  2: "血量",
+  3: "防御",
+  4: "速度",
+  5: "破甲",
+  6: "破甲抵抗",
+  7: "精准",
+  8: "格挡",
+  9: "减伤",
+  10: "暴击",
+  11: "暴击抵抗",
+  12: "爆伤",
+  13: "爆伤抵抗",
+  14: "技能伤害",
+  15: "免控",
+  16: "眩晕免疫",
+  17: "冰冻免疫",
+  18: "沉默免疫",
+  19: "流血免疫",
+  20: "中毒免疫",
+  21: "灼烧免疫",
+};
+
+const EQUIPMENT_NAME_MAP = ["武器", "衣服", "头盔", "坐骑"];
+const QUENCH_COLOR_MAP = {
+  1: "白",
+  2: "绿",
+  3: "蓝",
+  4: "紫",
+  5: "橙",
+  6: "红",
+};
+
+const getQuenchAttrName = (attrId) => {
+  if (!attrId) return "无属性";
+  return QUENCH_ATTR_MAP[attrId] || `属性${attrId}`;
+};
+
+const formatQuenchValue = (attrNum) => {
+  const num = Number(attrNum) || 0;
+  return Number.isInteger(num) ? `${num}%` : `${num.toFixed(2)}%`;
+};
+
+const getQuenchColorName = (colorId) => {
+  return QUENCH_COLOR_MAP[Number(colorId)] || `未知色阶`;
+};
+
+const getEquipmentEntries = (equipment) => {
+  const equipList = Object.values(equipment || {}).slice(0, 4);
+  return equipList.map((equ, idx) => {
+    const quenches = Object.entries(equ?.quenches || {})
+      .sort((a, b) => Number(a[0]) - Number(b[0]))
+      .map(([slotId, slot], innerIdx) => ({
+        slotId: Number(slotId),
+        displayIndex: innerIdx + 1,
+        colorId: Number(slot?.colorId || 0),
+        attrId: Number(slot?.attrId || 0),
+        attrNum: Number(slot?.attrNum || 0),
+        isLocked: Boolean(slot?.isLocked),
+      }));
+
+    return {
+      name: EQUIPMENT_NAME_MAP[idx] || `装备${idx + 1}`,
+      quenches,
+    };
+  });
+};
+
+const getFullRedSummary = (equipment) => {
+  const entries = getEquipmentEntries(equipment);
+  let redHoles = 0;
+  let totalHoles = 0;
+  let fullRedEquipCount = 0;
+
+  entries.forEach((equip) => {
+    const equipTotal = equip.quenches.length;
+    const equipRed = equip.quenches.filter((slot) => slot.colorId === 6).length;
+    totalHoles += equipTotal;
+    redHoles += equipRed;
+    if (equipTotal > 0 && equipRed === equipTotal) {
+      fullRedEquipCount += 1;
+    }
+  });
+
+  return { redHoles, totalHoles, fullRedEquipCount };
+};
 
 const tokenStore = useTokenStore();
 const message = useMessage();
@@ -656,6 +752,24 @@ const getHeroInfo = (heroObj) => {
   let holeCount = 0;
   let heroList = [];
 
+  const getHolyBeastLevel = (hero) => {
+    const hB = hero?.hB || {};
+    const rawLevel =
+      hB.order ??
+      hB.level ??
+      hB.lv ??
+      hero?.fourBasest?.level ??
+      hero?.fourBeast?.level ??
+      0;
+    return Number(rawLevel) || 0;
+  };
+
+  const isHolyBeastActive = (hero) => {
+    const hB = hero?.hB || {};
+    const level = getHolyBeastLevel(hero);
+    return hB.active === true || Number(hB.active || 0) > 0 || level > 0;
+  };
+
   try {
     // 检查英雄数据结构，确保可以遍历
     let heroesToProcess = [];
@@ -698,9 +812,10 @@ const getHeroInfo = (heroObj) => {
         level: hero.level || 0, //英雄等级
         hole: equipmentInfo.holeCount, //英雄开孔数量
         red: equipmentInfo.redCount, //英雄红数
-        // 兼容 hB 和 fourBasest
-        HolyBeast: (hero.hB?.active === true) || (hero.fourBasest?.level > 0), //激活四圣
-        HBlevel: hero.hB?.order || hero.fourBasest?.level || 0, //四圣等级
+        // 兼容多种四圣字段命名
+        HolyBeast: isHolyBeastActive(hero), //激活四圣
+        HBlevel: getHolyBeastLevel(hero), //四圣等级
+        hBData: hero.hB || null, //四圣完整数据（attack/hp/speed/skill1-3/up）
         // 添加英雄详情信息
         skillList: hero.skillList || [],
         attributeList: hero.attributeList || [],
@@ -744,6 +859,14 @@ const getEquipment = (equipment) => {
 const selectHeroInfo = (heroInfo) => {
   showHeroModal.value = true;
   heroModealTemp.value = heroInfo;
+};
+
+const formatJson = (value) => {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (error) {
+    return String(value);
+  }
 };
 
 const fetchAllMembersLineup = async () => {
@@ -2003,6 +2126,29 @@ const formatNumber = (num) => {
   font-size: var(--font-size-sm, 14px);
 }
 
+/* 四圣技能圆点 */
+.hb-skill-dot {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  margin-right: 4px;
+  border: 1px solid var(--border-light, #ccc);
+}
+.hb-skill-on  { background: #52c41a; border-color: #52c41a; }
+.hb-skill-off { background: var(--bg-tertiary, #ddd); }
+
+/* 四圣属性标签 */
+.hb-attr {
+  display: inline-block;
+  margin-right: 8px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: rgba(82, 196, 26, 0.1);
+  color: #52c41a;
+  font-size: 12px;
+}
+
 /* 武将详情模态框样式 */
 .hero-detail-modal {
   .hero-modal-content {
@@ -2080,6 +2226,13 @@ const formatNumber = (num) => {
     margin-top: 20px;
   }
 
+  .quench-summary {
+    margin-bottom: 10px;
+    font-size: 13px;
+    color: var(--text-primary, #333);
+    font-weight: 600;
+  }
+
   .section-title {
     margin: 0 0 15px 0;
     font-size: var(--font-size-base, 14px);
@@ -2094,7 +2247,20 @@ const formatNumber = (num) => {
 
   .equipment-item {
     display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 10px;
+    border: 1px solid var(--border-light, #eee);
+    border-radius: 8px;
+    background: var(--bg-secondary, #f9f9f9);
+  }
+
+  .equipment-topline {
+    width: 100%;
+    display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: 10px;
   }
 
@@ -2108,6 +2274,7 @@ const formatNumber = (num) => {
   .equipment-slots {
     display: flex;
     gap: 6px;
+    flex-wrap: wrap;
   }
 
   .equipment-slot {
@@ -2121,6 +2288,57 @@ const formatNumber = (num) => {
   .equipment-slot.red-slot {
     background: var(--error-color, #ff4d4f);
     border-color: var(--error-color, #ff4d4f);
+  }
+
+  .quench-list {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .quench-row {
+    display: grid;
+    grid-template-columns: 44px 50px 1fr auto auto;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.7);
+    font-size: 12px;
+    color: var(--text-secondary, #666);
+  }
+
+  .quench-slot {
+    color: var(--text-primary, #333);
+    font-weight: 500;
+  }
+
+  .quench-lock {
+    color: #fa8c16;
+  }
+
+  .quench-lock.locked {
+    color: #52c41a;
+    font-weight: 600;
+  }
+
+  .quench-attr {
+    color: var(--text-primary, #333);
+  }
+
+  .quench-value {
+    color: #d4380d;
+    font-weight: 600;
+  }
+
+  .quench-color {
+    color: #8c8c8c;
+  }
+
+  .quench-empty {
+    font-size: 12px;
+    color: #999;
   }
 
   /* 鱼灵洗练颜色块 */

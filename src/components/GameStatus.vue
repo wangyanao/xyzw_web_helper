@@ -67,6 +67,8 @@
     <!-- 武将升级助手（提取组件） -->
     <HeroUpgradeCard v-if="activeSection === 'tools'" />
 
+    <!-- 武将自动升级助手（提取组件） -->
+    <AutoHeroUpgradeCard v-if="activeSection === 'tools'" />
 
     <!-- 洗练助手（提取组件） -->
     <RefineHelperCard v-if="activeSection === 'tools'" />
@@ -279,6 +281,7 @@ import FightPvp from "./cards/FightPvp.vue";
 import FightHelperCard from "./cards/FightHelperCard.vue";
 import DreamHelperCard from "./cards/DreamHelperCard.vue";
 import HeroUpgradeCard from "./cards/HeroUpgradeCard.vue";
+import AutoHeroUpgradeCard from "./cards/AutoHeroUpgradeCard.vue";
 import ConsumptionProgressCard from "./cards/ConsumptionProgressCard.vue";
 import RefineHelperCard from "./cards/RefineHelperCard.vue";
 import TowerStatus from "./Tower/TowerStatus.vue";
