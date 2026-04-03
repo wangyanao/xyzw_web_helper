@@ -563,6 +563,52 @@ def save_lineups(lineups):
         os.replace(tmp, LINEUPS_FILE)
 
 
+def upsert_lineups_for_token(token_key, lineups):
+    """在同一锁内完成读取-更新-写回，避免并发覆盖"""
+    with _lineups_lock:
+        data = {}
+        try:
+            if os.path.isfile(LINEUPS_FILE):
+                with open(LINEUPS_FILE, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        data = loaded
+        except Exception:
+            data = {}
+
+        data[str(token_key)] = lineups
+
+        tmp = LINEUPS_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, LINEUPS_FILE)
+
+
+def delete_lineups_for_token(token_key):
+    """在同一锁内完成读取-删除-写回，避免并发覆盖"""
+    with _lineups_lock:
+        data = {}
+        try:
+            if os.path.isfile(LINEUPS_FILE):
+                with open(LINEUPS_FILE, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        data = loaded
+        except Exception:
+            data = {}
+
+        key = str(token_key)
+        deleted = key in data
+        if deleted:
+            del data[key]
+            tmp = LINEUPS_FILE + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, LINEUPS_FILE)
+
+        return deleted
+
+
 def _fire_task(task_id):
     """APScheduler 回调 —— 启动 Node.js 子进程执行任务"""
     tasks = load_tasks()
@@ -756,54 +802,50 @@ def get_lineups(token_id):
 
     all_lineups = load_lineups()
     token_key = str(token_id)
-    
+
     # 首先尝试用 token_id 作为 key 直接查询
     lineups = all_lineups.get(token_key, [])
     if not isinstance(lineups, list):
         lineups = []
-    
+
     # 如果 token_id 查询有结果，直接返回
     if lineups:
         return jsonify({'success': True, 'tokenId': token_key, 'lineups': lineups})
-    
+
     # 如果没找到，尝试用 roleId 查询（从请求参数中获取）
     role_id_str = request.args.get('roleId')
     if role_id_str:
         try:
             role_id = int(role_id_str)
-            # 遍历所有 lineups，按 token ID 查询并返回第一个非空的
-            # （假设同一个 roleId 可能对应多个过时的 token ID）
             tokens = load_tokens()
             for tid, tdata in tokens.items():
-                # 检查该 token 是否对应该 roleId
-                token_obj = tdata
+                token_role_id = None
                 try:
-                    # 如果 token 字段是 JSON 字符串，尝试解析
-                    if isinstance(tdata.get('token'), str) and tdata['token'].startswith('{'):
-                        token_obj = json.loads(tdata['token'])
-                    elif isinstance(tdata.get('token'), str):
-                        # 可能是 Base64，尝试解码
-                        try:
-                            import base64
-                            decoded = base64.b64decode(tdata['token']).decode('utf-8')
-                            token_obj = json.loads(decoded)
-                        except:
-                            pass
-                except:
-                    pass
-                
-                # 检查 roleId 是否匹配
-                if token_obj.get('roleId') == role_id or tdata.get('roleId') == role_id:
+                    raw_token = tdata.get('token')
+                    if isinstance(raw_token, str) and raw_token.startswith('{'):
+                        token_obj = json.loads(raw_token)
+                        token_role_id = token_obj.get('roleId')
+                except Exception:
+                    token_role_id = None
+
+                if token_role_id is None:
+                    try:
+                        token_role_id = int(tdata.get('roleId')) if tdata.get('roleId') is not None else None
+                    except Exception:
+                        token_role_id = None
+
+                # 仅在 roleId 精确匹配时返回，避免串号
+                if token_role_id == role_id:
                     lineups = all_lineups.get(str(tid), [])
                     if lineups and isinstance(lineups, list):
-                        return jsonify({'success': True, 'tokenId': str(tid), 'lineups': lineups, 'source': 'roleId_match'})
+                        return jsonify({
+                            'success': True,
+                            'tokenId': str(tid),
+                            'lineups': lineups,
+                            'source': 'roleId_match'
+                        })
         except (ValueError, TypeError):
             pass
-        
-        # 如果还是没找到，返回任意一个非空的 lineups（兜底）
-        for key, lineup_list in all_lineups.items():
-            if isinstance(lineup_list, list) and lineup_list:
-                return jsonify({'success': True, 'tokenId': key, 'lineups': lineup_list, 'source': 'fallback'})
 
     return jsonify({'success': True, 'tokenId': token_key, 'lineups': []})
 
@@ -820,11 +862,28 @@ def put_lineups(token_id):
         return jsonify({'error': 'lineups 必须是数组'}), 400
 
     token_key = str(token_id)
-    all_lineups = load_lineups()
-    all_lineups[token_key] = lineups
-    save_lineups(all_lineups)
 
-    return jsonify({'success': True, 'tokenId': token_key, 'count': len(lineups)})
+    # 归属校验：拒绝跨 token 写入，防止污染数据再次入库。
+    normalized_lineups = []
+    for idx, lineup in enumerate(lineups):
+        if not isinstance(lineup, dict):
+            return jsonify({'error': f'lineups[{idx}] 必须是对象'}), 400
+
+        owner_token_id = lineup.get('ownerTokenId')
+        if owner_token_id is not None and str(owner_token_id) != token_key:
+            return jsonify({
+                'error': f'lineups[{idx}].ownerTokenId 与请求 token_id 不一致',
+                'tokenId': token_key,
+                'ownerTokenId': str(owner_token_id),
+            }), 400
+
+        item = dict(lineup)
+        item['ownerTokenId'] = token_key
+        normalized_lineups.append(item)
+
+    upsert_lineups_for_token(token_key, normalized_lineups)
+
+    return jsonify({'success': True, 'tokenId': token_key, 'count': len(normalized_lineups)})
 
 
 @app.route('/api/lineups/<token_id>', methods=['DELETE'])
@@ -834,11 +893,7 @@ def delete_lineups(token_id):
         return jsonify({'error': 'token_id 不能为空'}), 400
 
     token_key = str(token_id)
-    all_lineups = load_lineups()
-    deleted = token_key in all_lineups
-    if deleted:
-        del all_lineups[token_key]
-        save_lineups(all_lineups)
+    deleted = delete_lineups_for_token(token_key)
 
     return jsonify({'success': True, 'tokenId': token_key, 'deleted': deleted})
 

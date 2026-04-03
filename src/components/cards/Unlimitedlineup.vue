@@ -655,12 +655,49 @@ const LINEUPS_API_BASE = "/api/lineups";
 
 const getStorageKey = (tokenId) => `${STORAGE_KEY}_${tokenId}`;
 
+const getCurrentRoleId = () => {
+  const token = tokenStore.selectedToken;
+  if (!token) return null;
+  return extractRoleIdFromToken(token.token);
+};
+
+const withLineupOwner = (lineup, tokenId, roleId) => ({
+  ...lineup,
+  ownerTokenId: String(tokenId),
+  ownerRoleId: roleId ?? null,
+});
+
+const normalizeLineupOwners = (lineups, tokenId, roleId) => {
+  if (!Array.isArray(lineups)) return [];
+  return lineups.map((lineup) => withLineupOwner(lineup, tokenId, roleId));
+};
+
+const filterOwnedLineups = (lineups, tokenId, roleId) => {
+  if (!Array.isArray(lineups)) return [];
+  return lineups.filter((lineup) => {
+    if (!lineup || typeof lineup !== "object") return false;
+
+    // 本地兜底时严格校验归属，避免历史污染数据串号。
+    if (lineup.ownerTokenId != null) {
+      return String(lineup.ownerTokenId) === String(tokenId);
+    }
+    if (lineup.ownerRoleId != null && roleId != null) {
+      return Number(lineup.ownerRoleId) === Number(roleId);
+    }
+    // 无归属信息的旧数据不再作为本地兜底使用，防止误写回后端。
+    return false;
+  });
+};
+
 const saveLineupsToLocal = () => {
   try {
     const token = tokenStore.selectedToken;
     if (!token) return;
+    const roleId = getCurrentRoleId();
     const key = getStorageKey(token.id);
-    localStorage.setItem(key, JSON.stringify(savedLineups.value));
+    const normalized = normalizeLineupOwners(savedLineups.value, token.id, roleId);
+    savedLineups.value = normalized;
+    localStorage.setItem(key, JSON.stringify(normalized));
   } catch (e) {
     console.error("保存阵容到本地缓存失败:", e);
   }
@@ -697,15 +734,9 @@ const extractRoleIdFromToken = (tokenStr) => {
   }
 };
 
-const fetchLineupsFromBackend = async (tokenId, tokenStr = null) => {
-  let url = `${LINEUPS_API_BASE}/${encodeURIComponent(String(tokenId))}`;
-  
-  // 尝试从 token 字符串中提取 roleId，作为查询参数传递
-  const roleId = tokenStr ? extractRoleIdFromToken(tokenStr) : null;
-  if (roleId) {
-    url += `?roleId=${encodeURIComponent(roleId)}`;
-  }
-  
+const fetchLineupsFromBackend = async (tokenId) => {
+  const url = `${LINEUPS_API_BASE}/${encodeURIComponent(String(tokenId))}`;
+
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const data = await resp.json();
@@ -731,10 +762,11 @@ const findMatchingLineup = (lineups, target) => {
 const resolveLineupForApply = async (targetLineup) => {
   const token = tokenStore.selectedToken;
   if (!token) return targetLineup;
+  const roleId = getCurrentRoleId();
 
   // 1) 后端优先
   try {
-    const backendLineups = await fetchLineupsFromBackend(token.id, token.token);
+    const backendLineups = await fetchLineupsFromBackend(token.id);
     const matched = findMatchingLineup(backendLineups, targetLineup);
     if (matched) return matched;
   } catch (e) {
@@ -742,7 +774,11 @@ const resolveLineupForApply = async (targetLineup) => {
   }
 
   // 2) 本地兜底
-  const localLineups = loadLineupsFromLocal();
+  const localLineups = filterOwnedLineups(
+    loadLineupsFromLocal(),
+    token.id,
+    roleId,
+  );
   const localMatched = findMatchingLineup(localLineups, targetLineup);
   if (localMatched) return localMatched;
 
@@ -1391,31 +1427,33 @@ const loadSavedLineups = async () => {
     savedLineups.value = [];
     return;
   }
+  const roleId = getCurrentRoleId();
 
   try {
-    const lineups = await fetchLineupsFromBackend(token.id, token.token);
-    const localCache = loadLineupsFromLocal();
-
-    // 首次启用后端持久化时，自动迁移历史本地数据
-    if (lineups.length === 0 && localCache.length > 0) {
-      savedLineups.value = localCache;
-      await saveLineupsToStorage();
-      return;
-    }
-
-    savedLineups.value = lineups;
+    const lineups = await fetchLineupsFromBackend(token.id);
+    savedLineups.value = normalizeLineupOwners(lineups, token.id, roleId);
 
     // 同步更新本地缓存，作为离线兜底
     saveLineupsToLocal();
   } catch (e) {
     console.error("加载后端阵容失败，回退本地缓存:", e);
-    savedLineups.value = loadLineupsFromLocal();
+    const localRaw = loadLineupsFromLocal();
+    const localOwned = filterOwnedLineups(localRaw, token.id, roleId);
+    savedLineups.value = localOwned;
+    // 清理本地污染缓存，避免后续误显示
+    if (localOwned.length !== localRaw.length) {
+      saveLineupsToLocal();
+    }
   }
 };
 
 const saveLineupsToStorage = async () => {
   const token = tokenStore.selectedToken;
   if (!token) return;
+  const roleId = getCurrentRoleId();
+
+  // 先规范归属字段，避免历史数据再次串号
+  savedLineups.value = normalizeLineupOwners(savedLineups.value, token.id, roleId);
 
   // 先落本地，避免网络失败时完全丢数据
   saveLineupsToLocal();
@@ -1642,6 +1680,8 @@ const saveCurrentLineup = async () => {
       applying: false,
       legionResearch: legionResearch,
       weaponId: weaponId,
+      ownerTokenId: String(token.id),
+      ownerRoleId: getCurrentRoleId(),
     });
 
     saveLineupsToStorage();
