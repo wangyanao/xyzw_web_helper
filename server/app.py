@@ -35,6 +35,7 @@ BIN_DIR = os.path.join(BASE_DIR, 'bin')
 DATA_DIR = os.path.join(BASE_DIR, 'data')
 TASKS_FILE = os.path.join(DATA_DIR, 'tasks.json')
 TOKENS_FILE = os.path.join(DATA_DIR, 'tokens.json')
+LINEUPS_FILE = os.path.join(DATA_DIR, 'lineups.json')
 USERS_FILE = os.path.join(DATA_DIR, 'users.json')
 BIN_MAP_FILE = os.path.join(DATA_DIR, 'bin_map.json')  # filename → tokenId (MD5)
 RUN_TASK_JS = os.path.join(BASE_DIR, 'run_task.js')
@@ -55,6 +56,7 @@ _sessions: dict = {}
 _users_lock = threading.Lock()
 _tokens_lock = threading.Lock()
 _bin_map_lock = threading.Lock()
+_lineups_lock = threading.Lock()
 
 
 # ===== 用户数据持久化 =====
@@ -541,6 +543,26 @@ def save_tokens(tokens):
         os.replace(tmp, TOKENS_FILE)
 
 
+def load_lineups():
+    """从 lineups.json 读取按 tokenId 归档的阵容数据"""
+    with _lineups_lock:
+        try:
+            with open(LINEUPS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+
+def save_lineups(lineups):
+    """保存按 tokenId 归档的阵容数据（原子写入）"""
+    with _lineups_lock:
+        tmp = LINEUPS_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(lineups, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, LINEUPS_FILE)
+
+
 def _fire_task(task_id):
     """APScheduler 回调 —— 启动 Node.js 子进程执行任务"""
     tasks = load_tasks()
@@ -724,6 +746,101 @@ def get_tokens():
         for v in tokens.values()
     ]
     return jsonify(result)
+
+
+@app.route('/api/lineups/<token_id>', methods=['GET'])
+def get_lineups(token_id):
+    """按 tokenId 或 roleId 获取已保存阵容"""
+    if not token_id:
+        return jsonify({'error': 'token_id 不能为空'}), 400
+
+    all_lineups = load_lineups()
+    token_key = str(token_id)
+    
+    # 首先尝试用 token_id 作为 key 直接查询
+    lineups = all_lineups.get(token_key, [])
+    if not isinstance(lineups, list):
+        lineups = []
+    
+    # 如果 token_id 查询有结果，直接返回
+    if lineups:
+        return jsonify({'success': True, 'tokenId': token_key, 'lineups': lineups})
+    
+    # 如果没找到，尝试用 roleId 查询（从请求参数中获取）
+    role_id_str = request.args.get('roleId')
+    if role_id_str:
+        try:
+            role_id = int(role_id_str)
+            # 遍历所有 lineups，按 token ID 查询并返回第一个非空的
+            # （假设同一个 roleId 可能对应多个过时的 token ID）
+            tokens = load_tokens()
+            for tid, tdata in tokens.items():
+                # 检查该 token 是否对应该 roleId
+                token_obj = tdata
+                try:
+                    # 如果 token 字段是 JSON 字符串，尝试解析
+                    if isinstance(tdata.get('token'), str) and tdata['token'].startswith('{'):
+                        token_obj = json.loads(tdata['token'])
+                    elif isinstance(tdata.get('token'), str):
+                        # 可能是 Base64，尝试解码
+                        try:
+                            import base64
+                            decoded = base64.b64decode(tdata['token']).decode('utf-8')
+                            token_obj = json.loads(decoded)
+                        except:
+                            pass
+                except:
+                    pass
+                
+                # 检查 roleId 是否匹配
+                if token_obj.get('roleId') == role_id or tdata.get('roleId') == role_id:
+                    lineups = all_lineups.get(str(tid), [])
+                    if lineups and isinstance(lineups, list):
+                        return jsonify({'success': True, 'tokenId': str(tid), 'lineups': lineups, 'source': 'roleId_match'})
+        except (ValueError, TypeError):
+            pass
+        
+        # 如果还是没找到，返回任意一个非空的 lineups（兜底）
+        for key, lineup_list in all_lineups.items():
+            if isinstance(lineup_list, list) and lineup_list:
+                return jsonify({'success': True, 'tokenId': key, 'lineups': lineup_list, 'source': 'fallback'})
+
+    return jsonify({'success': True, 'tokenId': token_key, 'lineups': []})
+
+
+@app.route('/api/lineups/<token_id>', methods=['PUT'])
+def put_lineups(token_id):
+    """按 tokenId 全量覆盖保存阵容"""
+    if not token_id:
+        return jsonify({'error': 'token_id 不能为空'}), 400
+
+    body = request.get_json(silent=True) or {}
+    lineups = body.get('lineups')
+    if not isinstance(lineups, list):
+        return jsonify({'error': 'lineups 必须是数组'}), 400
+
+    token_key = str(token_id)
+    all_lineups = load_lineups()
+    all_lineups[token_key] = lineups
+    save_lineups(all_lineups)
+
+    return jsonify({'success': True, 'tokenId': token_key, 'count': len(lineups)})
+
+
+@app.route('/api/lineups/<token_id>', methods=['DELETE'])
+def delete_lineups(token_id):
+    """按 tokenId 删除已保存阵容"""
+    if not token_id:
+        return jsonify({'error': 'token_id 不能为空'}), 400
+
+    token_key = str(token_id)
+    all_lineups = load_lineups()
+    deleted = token_key in all_lineups
+    if deleted:
+        del all_lineups[token_key]
+        save_lineups(all_lineups)
+
+    return jsonify({'success': True, 'tokenId': token_key, 'deleted': deleted})
 
 
 @app.route('/api/scheduler/jobs', methods=['GET'])

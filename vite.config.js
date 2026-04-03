@@ -201,6 +201,10 @@ export default defineConfig(async () => {
           target: "http://127.0.0.1:5001",
           changeOrigin: false,
         },
+        "/api/lineups": {
+          target: "http://127.0.0.1:5001",
+          changeOrigin: false,
+        },
         "/api/scheduler": {
           target: "http://127.0.0.1:5001",
           changeOrigin: false,

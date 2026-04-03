@@ -19,7 +19,6 @@
             'team-button',
             {
               active: currentTeam === teamId,
-              virtual: isVirtualTemplateTeam(teamId),
             },
           ]"
           @click="selectTeam(teamId)"
@@ -54,18 +53,9 @@
         <span class="label">当前阵容</span>
         <span class="team-number">
           <template v-if="!loading">
-            {{ isCurrentVirtualTeam ? `模板 ${currentTeam}` : `阵容 ${currentTeam}` }}
+            {{ `阵容 ${currentTeam}` }}
           </template>
           <template v-else>加载中…</template>
-        </span>
-      </div>
-
-      <div class="team-meta-row">
-        <span :class="['team-kind-badge', isCurrentVirtualTeam ? 'virtual' : 'real']">
-          {{ isCurrentVirtualTeam ? '本地模板' : '真实阵容' }}
-        </span>
-        <span v-if="isCurrentVirtualTeam" class="team-kind-note">
-          仅保存在本地，可供后续支持 battleTeam 的功能复用
         </span>
       </div>
 
@@ -116,56 +106,10 @@
         </div>
 
         <div v-if="!loading && !currentTeamHeroes.length" class="empty-team">
-          <p>{{ isCurrentVirtualTeam ? '当前模板为空，请在下方配置阵容' : '暂无队伍信息' }}</p>
+          <p>暂无队伍信息</p>
         </div>
         <div v-if="loading" class="empty-team">
           <p>正在加载队伍信息…</p>
-        </div>
-      </div>
-
-      <div v-if="isCurrentVirtualTeam" class="virtual-editor">
-        <div class="virtual-editor-header">
-          <span class="virtual-editor-title">模板配置</span>
-          <span class="virtual-editor-hint">不会写回游戏服务器</span>
-        </div>
-
-        <div class="virtual-editor-toolbar">
-          <label class="toolbar-group">
-            <span>复制来源</span>
-            <select v-model.number="copySourceTeam" class="editor-select compact">
-              <option v-for="teamId in realTeamIds" :key="teamId" :value="teamId">
-                真实阵容 {{ teamId }}
-              </option>
-            </select>
-          </label>
-
-          <button
-            class="editor-button"
-            :disabled="!realTeamIds.length"
-            @click="copyRealTeamToVirtual"
-          >
-            复制到当前模板
-          </button>
-
-          <button class="editor-button secondary" @click="clearCurrentVirtualTeam">
-            清空模板
-          </button>
-        </div>
-
-        <div class="virtual-editor-grid">
-          <label v-for="pos in teamSlots" :key="pos" class="editor-slot">
-            <span class="editor-slot-label">{{ positionLabels[pos] }}</span>
-            <select
-              class="editor-select"
-              :value="getVirtualSlotHeroId(pos)"
-              @change="onVirtualSlotChange(pos, $event)"
-            >
-              <option :value="0">空位</option>
-              <option v-for="hero in ownedHeroOptions" :key="hero.id" :value="hero.id">
-                {{ hero.name }} · Lv.{{ hero.level }}
-              </option>
-            </select>
-          </label>
         </div>
       </div>
     </div>
@@ -182,16 +126,11 @@ const tokenStore = useTokenStore();
 const message = useMessage();
 
 const MAX_TEAM_ID = 6;
-const VIRTUAL_TEMPLATE_START = 3;
-const teamSlots = [0, 1, 2, 3, 4];
-const positionLabels = ["前排 1", "前排 2", "后排 1", "后排 2", "后排 3"];
 
 const loading = ref(false);
 const switching = ref(false);
 const currentTeam = ref(1);
-const availableTeams = ref<number[]>([1, 2, 3, 4, 5, 6]);
-const copySourceTeam = ref(1);
-const virtualTemplates = ref<Record<number, Record<string, number>>>({});
+const availableTeams = ref<number[]>([1, 2]);
 
 const wsStatus = computed(() => {
   if (!tokenStore.selectedToken) return "disconnected";
@@ -202,59 +141,6 @@ const presetTeamRaw = computed(() => tokenStore.gameData?.presetTeam ?? null);
 const ownedHeroesMap = computed(
   () => (tokenStore.gameData as any)?.roleInfo?.role?.heroes || {},
 );
-
-function buildEmptyTemplate() {
-  return {
-    "0": 0,
-    "1": 0,
-    "2": 0,
-    "3": 0,
-    "4": 0,
-  };
-}
-
-function getVirtualTemplateStorageKey(tokenId: string | number) {
-  return `virtual-team-templates:${tokenId}`;
-}
-
-function normalizeTemplate(template: any) {
-  const normalized = buildEmptyTemplate();
-  for (const pos of teamSlots) {
-    const value = Number(template?.[String(pos)] || 0);
-    normalized[String(pos)] = Number.isFinite(value) ? value : 0;
-  }
-  return normalized;
-}
-
-function loadVirtualTemplates(tokenId: string | number) {
-  try {
-    const raw = localStorage.getItem(getVirtualTemplateStorageKey(tokenId));
-    if (!raw) {
-      virtualTemplates.value = {};
-      return;
-    }
-    const parsed = JSON.parse(raw);
-    const nextTemplates: Record<number, Record<string, number>> = {};
-    for (let teamId = VIRTUAL_TEMPLATE_START; teamId <= MAX_TEAM_ID; teamId++) {
-      if (parsed?.[teamId]) {
-        nextTemplates[teamId] = normalizeTemplate(parsed[teamId]);
-      }
-    }
-    virtualTemplates.value = nextTemplates;
-  } catch (error) {
-    console.warn("加载虚拟阵容模板失败:", error);
-    virtualTemplates.value = {};
-  }
-}
-
-function persistVirtualTemplates() {
-  const tokenId = tokenStore.selectedToken?.id;
-  if (!tokenId) return;
-  localStorage.setItem(
-    getVirtualTemplateStorageKey(tokenId),
-    JSON.stringify(virtualTemplates.value),
-  );
-}
 
 function getHeroAvatar(heroId: number) {
   const avatarPath = HERO_DICT[heroId]?.avatar;
@@ -357,29 +243,13 @@ const ownedHeroOptions = computed(() =>
     }),
 );
 
-const isVirtualTemplateTeam = (teamId: number) =>
-  teamId >= VIRTUAL_TEMPLATE_START &&
-  teamId <= MAX_TEAM_ID &&
-  !realTeamIds.value.includes(teamId);
-
-const isCurrentVirtualTeam = computed(() =>
-  isVirtualTemplateTeam(currentTeam.value),
-);
-
 function getRealTeamInfo(teamId: number) {
   return ((presetTeam.value.teams as any)?.[teamId]?.teamInfo || null) as
     | Record<string, any>
     | null;
 }
 
-function getVirtualTeamTemplate(teamId: number) {
-  return virtualTemplates.value[teamId] || buildEmptyTemplate();
-}
-
 const currentTeamHeroes = computed(() => {
-  if (isCurrentVirtualTeam.value) {
-    return teamInfoToHeroes(getVirtualTeamTemplate(currentTeam.value), true);
-  }
   return teamInfoToHeroes(getRealTeamInfo(currentTeam.value));
 });
 
@@ -435,91 +305,27 @@ const getTeamInfoWithCache = async (force = false) => {
 };
 
 const updateAvailableTeams = () => {
-  availableTeams.value = Array.from({ length: MAX_TEAM_ID }, (_, i) => i + 1);
+  if (realTeamIds.value.length) {
+    availableTeams.value = [...realTeamIds.value];
+    return;
+  }
+  availableTeams.value = Array.from({ length: Math.min(MAX_TEAM_ID, 2) }, (_, i) => i + 1);
 };
 const updateCurrentTeam = (forceServerTeam = false) => {
   const serverTeamId = (presetTeam.value as any).useTeamId || 1;
-  if (forceServerTeam || !isVirtualTemplateTeam(currentTeam.value)) {
+  if (forceServerTeam) {
     currentTeam.value = serverTeamId;
-  }
-};
-
-const getVirtualSlotHeroId = (pos: number) =>
-  Number(getVirtualTeamTemplate(currentTeam.value)?.[String(pos)] || 0);
-
-const updateVirtualSlot = (pos: number, heroId: number) => {
-  const nextTemplate = {
-    ...getVirtualTeamTemplate(currentTeam.value),
-  };
-
-  if (heroId > 0) {
-    for (const slot of teamSlots) {
-      if (slot !== pos && Number(nextTemplate[String(slot)]) === heroId) {
-        nextTemplate[String(slot)] = 0;
-      }
-    }
-  }
-
-  nextTemplate[String(pos)] = heroId;
-  virtualTemplates.value = {
-    ...virtualTemplates.value,
-    [currentTeam.value]: normalizeTemplate(nextTemplate),
-  };
-  persistVirtualTemplates();
-};
-
-const onVirtualSlotChange = (pos: number, event: Event) => {
-  const target = event.target as HTMLSelectElement;
-  updateVirtualSlot(pos, Number(target.value || 0));
-};
-
-const copyRealTeamToVirtual = () => {
-  if (!isCurrentVirtualTeam.value) return;
-  const sourceTeamId = realTeamIds.value.includes(copySourceTeam.value)
-    ? copySourceTeam.value
-    : realTeamIds.value[0];
-  const sourceTeam = getRealTeamInfo(sourceTeamId);
-  if (!sourceTeam) {
-    message.warning("当前没有可复制的真实阵容");
     return;
   }
-
-  const copiedTemplate = buildEmptyTemplate();
-  for (const pos of teamSlots) {
-    copiedTemplate[String(pos)] = Number(
-      (sourceTeam as any)?.[String(pos)]?.heroId || 0,
-    );
+  if (!availableTeams.value.includes(currentTeam.value)) {
+    currentTeam.value = serverTeamId;
   }
-
-  virtualTemplates.value = {
-    ...virtualTemplates.value,
-    [currentTeam.value]: copiedTemplate,
-  };
-  persistVirtualTemplates();
-  message.success(`已复制真实阵容 ${sourceTeamId} 到模板 ${currentTeam.value}`);
-};
-
-const clearCurrentVirtualTeam = () => {
-  if (!isCurrentVirtualTeam.value) return;
-  virtualTemplates.value = {
-    ...virtualTemplates.value,
-    [currentTeam.value]: buildEmptyTemplate(),
-  };
-  persistVirtualTemplates();
-  message.success(`模板 ${currentTeam.value} 已清空`);
 };
 
 const selectTeam = async (teamId: number) => {
   if (switching.value || loading.value) return;
   if (!tokenStore.selectedToken) {
     message.warning("请先选择Token");
-    return;
-  }
-  if (isVirtualTemplateTeam(teamId)) {
-    currentTeam.value = teamId;
-    if (!ownedHeroOptions.value.length) {
-      tokenStore.sendMessage(tokenStore.selectedToken.id, "role_getroleinfo");
-    }
     return;
   }
   if (!realTeamIds.value.includes(teamId)) {
@@ -550,9 +356,6 @@ const refreshTeamData = async (force = false) => {
 };
 
 onMounted(async () => {
-  if (tokenStore.selectedToken) {
-    loadVirtualTemplates(tokenStore.selectedToken.id);
-  }
   if (tokenStore.selectedToken && wsStatus.value === "connected") {
     await refreshTeamData(false);
     updateAvailableTeams();
@@ -588,7 +391,6 @@ watch(
   () => tokenStore.selectedToken,
   async (newToken, oldToken) => {
     if (newToken && newToken.id !== (oldToken as any)?.id) {
-      loadVirtualTemplates(newToken.id);
       const status = tokenStore.getWebSocketStatus(newToken.id);
       if (status === "connected") {
         await refreshTeamData(true);
@@ -599,20 +401,6 @@ watch(
       }
     }
   },
-);
-
-watch(
-  () => realTeamIds.value,
-  (ids) => {
-    if (!ids.length) {
-      copySourceTeam.value = 1;
-      return;
-    }
-    if (!ids.includes(copySourceTeam.value)) {
-      copySourceTeam.value = ids[0];
-    }
-  },
-  { immediate: true },
 );
 
 watch(
@@ -680,18 +468,6 @@ watch(
 
 .team-button.active {
   background: var(--primary-color);
-  color: white;
-}
-
-.team-button.virtual {
-  border: 1px dashed rgba(59, 130, 246, 0.35);
-  background: rgba(59, 130, 246, 0.08);
-  color: #2563eb;
-}
-
-.team-button.virtual.active {
-  border-style: solid;
-  background: #2563eb;
   color: white;
 }
 
@@ -778,38 +554,6 @@ watch(
   color: var(--text-primary);
 }
 
-.team-meta-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: var(--spacing-sm);
-  flex-wrap: wrap;
-}
-
-.team-kind-badge {
-  display: inline-flex;
-  align-items: center;
-  height: 24px;
-  padding: 0 10px;
-  border-radius: 999px;
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.team-kind-badge.real {
-  background: rgba(16, 185, 129, 0.12);
-  color: #047857;
-}
-
-.team-kind-badge.virtual {
-  background: rgba(59, 130, 246, 0.12);
-  color: #1d4ed8;
-}
-
-.team-kind-note {
-  font-size: 12px;
-  color: var(--text-secondary);
-}
 
 .heroes-container {
   background: var(--bg-tertiary);
@@ -881,103 +625,6 @@ watch(
   font-size: var(--font-size-sm);
 }
 
-.virtual-editor {
-  margin-top: var(--spacing-md);
-  padding: var(--spacing-sm);
-  border: 1px solid rgba(59, 130, 246, 0.16);
-  border-radius: var(--border-radius-medium);
-  background: rgba(59, 130, 246, 0.04);
-}
-
-.virtual-editor-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 12px;
-  flex-wrap: wrap;
-}
-
-.virtual-editor-title {
-  font-size: 13px;
-  font-weight: 700;
-  color: var(--text-primary);
-}
-
-.virtual-editor-hint {
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-
-.virtual-editor-toolbar {
-  display: flex;
-  gap: 10px;
-  align-items: flex-end;
-  flex-wrap: wrap;
-  margin-bottom: 12px;
-}
-
-.toolbar-group {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-
-.virtual-editor-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-}
-
-.editor-slot {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.editor-slot-label {
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-
-.editor-select {
-  width: 100%;
-  min-width: 0;
-  height: 34px;
-  padding: 0 10px;
-  border: 1px solid rgba(148, 163, 184, 0.35);
-  border-radius: 10px;
-  background: var(--bg-primary);
-  color: var(--text-primary);
-}
-
-.editor-select.compact {
-  min-width: 120px;
-}
-
-.editor-button {
-  height: 34px;
-  padding: 0 12px;
-  border: none;
-  border-radius: 10px;
-  background: #2563eb;
-  color: white;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.editor-button.secondary {
-  background: rgba(15, 23, 42, 0.08);
-  color: var(--text-primary);
-}
-
-.editor-button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
 
 @media (max-width: 768px) {
   .card-header {
@@ -1022,8 +669,5 @@ watch(
     text-overflow: ellipsis;
   }
 
-  .virtual-editor-grid {
-    grid-template-columns: 1fr;
-  }
 }
 </style>

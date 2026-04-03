@@ -73,6 +73,9 @@
     <!-- 洗练助手（提取组件） -->
     <RefineHelperCard v-if="activeSection === 'tools'" />
 
+    <!-- 阵容助手（提取组件） -->
+    <Unlimitedlineup v-if="activeSection === 'tools'" />
+
     <!-- 消耗活动进度（提取组件） -->
     <ConsumptionProgressCard v-if="activeSection === 'tools'" />
     <!-- 咸王宝库（提取组件） -->
@@ -284,6 +287,7 @@ import HeroUpgradeCard from "./cards/HeroUpgradeCard.vue";
 import AutoHeroUpgradeCard from "./cards/AutoHeroUpgradeCard.vue";
 import ConsumptionProgressCard from "./cards/ConsumptionProgressCard.vue";
 import RefineHelperCard from "./cards/RefineHelperCard.vue";
+import Unlimitedlineup from "./cards/Unlimitedlineup.vue";
 import TowerStatus from "./Tower/TowerStatus.vue";
 import WeirdTowerStatus from "./Tower/WeirdTowerStatus.vue";
 import BossTower from "./Tower/BossTower.vue";

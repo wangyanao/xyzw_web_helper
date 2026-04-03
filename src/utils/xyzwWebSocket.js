@@ -278,6 +278,20 @@ export function registerDefaultCommands(reg) {
     .register("presetteam_saveteam", { teamId: 1 })
     .register("role_gettargetteam")
 
+    // 武将操作相关（阵容助手）
+    .register("hero_exchange")
+    .register("hero_gointobattle")
+    .register("hero_gobackbattle")
+    .register("hero_rebirth")
+    .register("artifact_load")
+    .register("artifact_unload")
+    .register("lordweapon_changedefaultweapon")
+    .register("pearl_replaceskill")
+    .register("pearl_exchangeskill")
+    .register("pearl_unloadskill")
+    .register("legion_research")
+    .register("legion_resetresearch")
+
     // 武将升级相关
     .register("hero_heroupgradelevel") //武将升级
     .register("hero_heroupgradeorder") //武将进阶
@@ -1084,6 +1098,11 @@ export class XyzwWebSocketClient {
       hero_heroupgradestarresp: "hero_heroupgradestar",
       book_upgraderesp: "book_upgrade",
       book_claimpointrewardresp: "book_claimpointreward",
+      // 阵容助手相关响应映射
+      pearl_replaceskillresp: "pearl_replaceskill",
+      pearl_exchangeskillresp: "pearl_exchangeskill",
+      pearl_unloadskillresp: "pearl_unloadskill",
+      legion_researchresp: ["legion_research", "legion_resetresearch"],
       // 军团信息
       legion_getinforesp: "legion_getinfo",
       legion_getinforresp: "legion_getinfo",
@@ -1118,6 +1137,9 @@ export class XyzwWebSocketClient {
         "system_mysharecallback",
         "task_claimdailypoint",
         "role_commitpassword",
+        "hero_gointobattle",
+        "hero_gobackbattle",
+        "lordweapon_changedefaultweapon",
       ],
       syncrewardresp: [
         "system_buygold",
@@ -1129,6 +1151,8 @@ export class XyzwWebSocketClient {
         "system_signinreward",
         "dungeon_selecthero",
         "artifact_exchange",
+        "hero_exchange",
+        "hero_rebirth",
       ],
     };
 
