@@ -20,12 +20,14 @@ import { darkTheme } from "naive-ui";
 import { useTheme } from "@/composables/useTheme";
 import { useLocalFileSync } from "@/composables/useLocalFileSync";
 import { useTokenStore } from "@/stores/tokenStore";
+import { useUserStore } from "@/stores/userStore";
 import { useRouter } from "vue-router";
 
 const { isDark, initTheme, setupSystemThemeListener, updateReactiveState } =
   useTheme();
 const fileSync = useLocalFileSync();
 const tokenStore = useTokenStore();
+const userStore = useUserStore();
 const router = useRouter();
 
 // Naive UI 主题
@@ -43,22 +45,61 @@ const handleThemeChange = () => {
   }, 50);
 };
 
+// iOS/移动端：页面从后台恢复时，若 WebSocket 已断则自动重连
+const handleVisibilityChange = () => {
+  if (document.visibilityState === "visible") {
+    const tid = tokenStore.selectedTokenId;
+    if (!tid) return;
+    const status = tokenStore.getWebSocketStatus(tid);
+    if (status === "disconnected" || status === "error") {
+      tokenStore.selectToken(tid, true);
+    }
+  }
+};
+
+// iOS Safari bfcache（浏览器前进/后退缓存）恢复时，WebSocket 句柄必然失效，强制重连
+const handlePageShow = (e) => {
+  if (e.persisted) {
+    const tid = tokenStore.selectedTokenId;
+    if (tid) {
+      setTimeout(() => tokenStore.selectToken(tid, true), 100);
+    }
+  }
+};
+
 onMounted(async () => {
   initTheme();
   setupSystemThemeListener();
 
   // 监听自定义主题变化事件
   window.addEventListener("theme-change", handleThemeChange);
+  // iOS/移动端后台恢复重连
+  document.addEventListener("visibilitychange", handleVisibilityChange);
+  window.addEventListener("pageshow", handlePageShow);
 
   // 初始化时更新状态
   updateReactiveState();
 
   // 全局初始化本地文件同步句柄（从 IndexedDB 恢复已绑定的文件）
   await fileSync.init();
+
+  // 已登录会话在应用启动时按用户可见范围重建 Token 列表
+  if (userStore.isLoggedIn) {
+    await userStore.refreshMe().catch(() => {});
+    await tokenStore.reloadTokensForCurrentUser();
+  } else {
+    // 无密码保护模式：刷新页面后，直接重连本地上次选中的 token
+    const tid = tokenStore.selectedTokenId;
+    if (tid) {
+      setTimeout(() => tokenStore.selectToken(tid, true), 300);
+    }
+  }
 });
 
 onUnmounted(() => {
   window.removeEventListener("theme-change", handleThemeChange);
+  document.removeEventListener("visibilitychange", handleVisibilityChange);
+  window.removeEventListener("pageshow", handlePageShow);
 });
 </script>
 

@@ -1,5 +1,9 @@
 FROM python:3.11-slim
 
+# 设置系统时区为上海（北京时间 UTC+8）
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
 # 安装 Node.js（用于执行定时任务脚本）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     nodejs npm vim \

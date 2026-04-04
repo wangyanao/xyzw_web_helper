@@ -571,10 +571,13 @@ watch(wsStatus, (newStatus, oldStatus) => {
   ) {
     // 延迟一点时间让WebSocket完全就绪
     setTimeout(async () => {
+      // 延迟期间 WS 可能已断（被踢号/bfcache），复查后再执行
+      if (wsStatus.value !== "connected") return;
       await refreshTeamData(false);
       updateAvailableTeams();
       updateCurrentTeam();
       if (!presetTeamRaw.value) {
+        if (wsStatus.value !== "connected") return;
         await refreshTeamData(true);
         updateAvailableTeams();
         updateCurrentTeam();

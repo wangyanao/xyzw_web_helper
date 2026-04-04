@@ -375,10 +375,13 @@ watch(wsStatus, (newStatus, oldStatus) => {
     tokenStore.selectedToken
   ) {
     setTimeout(async () => {
+      // 延迟期间 WS 可能已断（被踢号/bfcache），复查后再执行
+      if (wsStatus.value !== "connected") return;
       await refreshTeamData(false);
       updateAvailableTeams();
       updateCurrentTeam(true);
       if (!presetTeamRaw.value) {
+        if (wsStatus.value !== "connected") return;
         await refreshTeamData(true);
         updateAvailableTeams();
         updateCurrentTeam(true);

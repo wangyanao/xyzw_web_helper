@@ -439,6 +439,7 @@ def list_bins():
     if not check_secret():
         return jsonify({'error': '密钥错误'}), 403
 
+    bin_map = load_bin_map()  # filename -> tokenId
     all_files = []
     for fname in sorted(os.listdir(BIN_DIR)):
         if not fname.endswith('.bin'):
@@ -449,6 +450,7 @@ def list_bins():
             'name': fname,
             'size': stat.st_size,
             'mtime': int(stat.st_mtime),
+            'tokenId': bin_map.get(fname, ''),
         })
 
     # 尝试从 session 判断角色，普通用户按 assignedTokenIds 过滤
@@ -458,7 +460,6 @@ def list_bins():
         users = load_users()
         user = users.get(session['userId'])
         assigned = set(user.get('assignedTokenIds', [])) if user else set()
-        bin_map = load_bin_map()  # filename -> tokenId
         all_files = [f for f in all_files if bin_map.get(f['name']) in assigned]
 
     return jsonify({'files': all_files})
@@ -792,6 +793,36 @@ def get_tokens():
         for v in tokens.values()
     ]
     return jsonify(result)
+
+
+@app.route('/api/tokens/full', methods=['GET'])
+@require_auth
+def get_full_tokens_for_current_user():
+    """按当前登录用户返回可见 token 全量信息（含 token 字段）"""
+    tokens = load_tokens()
+    session = request.session
+
+    if session.get('role') == 'admin':
+        return jsonify({
+            'success': True,
+            'tokens': list(tokens.values()),
+            'scope': 'admin_all',
+        })
+
+    users = load_users()
+    me = users.get(session.get('userId')) or {}
+    assigned_ids = set(me.get('assignedTokenIds', []) if isinstance(me.get('assignedTokenIds', []), list) else [])
+
+    visible = [
+        t for tid, t in tokens.items()
+        if tid in assigned_ids
+    ]
+
+    return jsonify({
+        'success': True,
+        'tokens': visible,
+        'scope': 'user_assigned',
+    })
 
 
 @app.route('/api/lineups/<token_id>', methods=['GET'])

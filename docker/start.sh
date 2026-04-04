@@ -1,6 +1,9 @@
 #!/bin/sh
 # 启动脚本：先启动 Flask 后端，再启动 nginx
 
+# 确保系统时区为北京时间
+export TZ=Asia/Shanghai
+
 # 创建 bin 存储目录
 mkdir -p /app/server/bin
 

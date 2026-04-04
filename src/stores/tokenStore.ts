@@ -13,6 +13,8 @@ import { emitPlus } from "./events/index.js";
 import router from "@/router";
 import { useUserStore } from "@/stores/userStore";
 
+const SESSION_KEY = "xyzw_session_token";
+
 const { getArrayBuffer, storeArrayBuffer, deleteArrayBuffer, clearAll } = useIndexedDB();
 
 declare interface TokenData {
@@ -225,6 +227,63 @@ export const useTokenStore = defineStore("tokens", () => {
     }).catch(() => { /* 服务端不可用时静默忽略 */ });
   };
 
+  // 按当前登录用户可见范围从后端重建 Token 列表
+  const reloadTokensForCurrentUser = async () => {
+    try {
+      const sessionToken = sessionStorage.getItem(SESSION_KEY) || "";
+      if (!sessionToken) return { success: false, reason: "no-session" };
+
+      const resp = await fetch('/api/tokens/full', {
+        headers: {
+          'X-Session-Token': sessionToken,
+          'Content-Type': 'application/json',
+        },
+      });
+
+      if (!resp.ok) {
+        return { success: false, reason: `http-${resp.status}` };
+      }
+
+      const data = await resp.json();
+      const serverTokens = Array.isArray(data?.tokens) ? data.tokens : [];
+
+      // 关闭本地已不存在 token 的连接，避免切用户后残留连接
+      const nextIds = new Set(serverTokens.map((t: any) => String(t.id)));
+      const staleIds = gameTokens.value
+        .map((t) => t.id)
+        .filter((id) => !nextIds.has(String(id)));
+      staleIds.forEach((id) => {
+        if (wsConnections.value[id]) closeWebSocketConnection(id);
+      });
+
+      gameTokens.value = serverTokens as TokenData[];
+
+      // 修正选中 token
+      if (selectedTokenId.value && !nextIds.has(String(selectedTokenId.value))) {
+        selectedTokenId.value = serverTokens[0]?.id || "";
+      } else if (!selectedTokenId.value && serverTokens.length > 0) {
+        selectedTokenId.value = serverTokens[0].id;
+      }
+
+      // 切换账号后自动重连当前选中的 token，避免页面一直显示未连接。
+      const targetId = selectedTokenId.value || serverTokens[0]?.id;
+      if (targetId) {
+        setTimeout(() => {
+          try {
+            selectToken(targetId, true);
+          } catch {}
+        }, 50);
+      }
+
+      cleanupInvalidTokens();
+      return { success: true, count: serverTokens.length, scope: data?.scope || null };
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      tokenLogger.error('按用户重载 Token 失败:', errMsg);
+      return { success: false, reason: 'exception' };
+    }
+  };
+
   // Token管理
   const addToken = (tokenData: TokenData) => {
     let id = tokenData.id || `token_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -376,6 +435,11 @@ export const useTokenStore = defineStore("tokens", () => {
   // Token刷新尝试记录
   const tokenRefreshAttempts = ref<Record<string, number>>({});
 
+  // 自动重连状态（跨连接生命周期持久保存，用于指数退避）
+  const tokenReconnectState = ref<Record<string, { attempts: number; timerId: ReturnType<typeof setTimeout> | null }>>({});
+  // 最多重连 8 次：5s/9s/16s/29s/52s/94s/120s/120s，覆盖约 5 分钟服务器冷却期
+  const MAX_AUTO_RECONNECT = 8;
+
   // 尝试自动刷新Token
   const attemptTokenRefresh = async (tokenId: string, forceReconnect = false) => {
     // 检查冷却时间 (10秒)
@@ -418,6 +482,32 @@ export const useTokenStore = defineStore("tokens", () => {
           if (tokenByName) {
             userToken = tokenByName;
             usedOldKey = true;
+          }
+        }
+
+        // 普通用户常见场景：本地无 bin 缓存，尝试从服务器按 tokenId 拉取 bin
+        if (!userToken) {
+          try {
+            const sessionToken = sessionStorage.getItem(SESSION_KEY) || "";
+            const headers: Record<string, string> = sessionToken
+              ? { "X-Session-Token": sessionToken }
+              : {};
+            const listResp = await fetch('/api/bin/list', { headers });
+            if (listResp.ok) {
+              const listJson = await listResp.json();
+              const files = Array.isArray(listJson?.files) ? listJson.files : [];
+              const matched = files.find((f: any) => String(f?.tokenId || "") === String(tokenId));
+              if (matched?.name) {
+                const dlResp = await fetch(`/api/bin/download/${encodeURIComponent(matched.name)}`, { headers });
+                if (dlResp.ok) {
+                  userToken = await dlResp.arrayBuffer();
+                  await storeArrayBuffer(tokenId, userToken);
+                  wsLogger.info(`从服务器BIN恢复成功 [${tokenId}] ${matched.name}`);
+                }
+              }
+            }
+          } catch (error) {
+            wsLogger.warn(`从服务器BIN恢复失败 [${tokenId}]`, error);
           }
         }
 
@@ -758,10 +848,10 @@ export const useTokenStore = defineStore("tokens", () => {
       // 3. 更新跨标签页状态为连接中
       updateCrossTabConnectionState(tokenId, "connecting");
 
-      // 4. 如果存在现有连接，先优雅关闭
+      // 4. 如果存在现有连接，先优雅关闭（内部替换，保留重连计数）
       if (wsConnections.value[tokenId]) {
         wsLogger.debug(`优雅关闭现有连接: ${tokenId}`);
-        await closeWebSocketConnectionAsync(tokenId);
+        await closeWebSocketConnectionAsync(tokenId, false);
       }
 
       // 5. 解析token
@@ -837,6 +927,8 @@ export const useTokenStore = defineStore("tokens", () => {
           wsConnections.value[tokenId].lastRandomSeedSource = null;
           wsConnections.value[tokenId].lastRandomSeed = null;
         }
+        // 连接成功：重置自动重连计数
+        tokenReconnectState.value[tokenId] = { attempts: 0, timerId: null };
         updateCrossTabConnectionState(tokenId, "connected");
         releaseConnectionLock(tokenId, "connect");
         localStorage.removeItem("xyzw_chat_msg_list");
@@ -864,6 +956,33 @@ export const useTokenStore = defineStore("tokens", () => {
           }
         }
         updateCrossTabConnectionState(tokenId, "disconnected");
+
+        // ---- 指数退避自动重连 ----
+        // wsConnections[tokenId] 被主动删除（closeWebSocketConnectionAsync）则说明用户主动断开，不重连
+        const currConn = wsConnections.value[tokenId];
+        if (!currConn) return;
+        // 若 attemptTokenRefresh 已触发了新的连接，也跳过
+        if (currConn.status === "connected" || currConn.status === "connecting") return;
+
+        const rs = tokenReconnectState.value[tokenId] ?? { attempts: 0, timerId: null };
+        if (rs.attempts < MAX_AUTO_RECONNECT) {
+          rs.attempts++;
+          const delay = Math.min(Math.round(5000 * Math.pow(1.8, rs.attempts - 1)), 120000);
+          wsLogger.info(`断线，将在 ${Math.round(delay / 1000)}s 后第 ${rs.attempts} 次自动重连 [${tokenId}]`);
+          rs.timerId = setTimeout(() => {
+            rs.timerId = null;
+            const c = wsConnections.value[tokenId];
+            // 连接已被主动清理或已连接，跳过
+            if (!c || c.status === "connected" || c.status === "connecting") return;
+            const token = gameTokens.value.find((t) => t.id === tokenId);
+            if (!token) return;
+            wsLogger.info(`执行第 ${rs.attempts} 次自动重连 [${tokenId}]`);
+            createWebSocketConnection(tokenId, token.token, token.wsUrl);
+          }, delay);
+          tokenReconnectState.value[tokenId] = rs;
+        } else {
+          wsLogger.warn(`已超过最大自动重连次数(${MAX_AUTO_RECONNECT})，停止重连 [${tokenId}]`);
+        }
       };
 
       wsClient.onError = (error) => {
@@ -908,7 +1027,18 @@ export const useTokenStore = defineStore("tokens", () => {
   };
 
   // 异步版本的关闭连接（优雅关闭）
-  const closeWebSocketConnectionAsync = async (tokenId: string) => {
+  // cancelReconnect=true（默认）：取消自动重连定时器（用户主动断开）
+  // cancelReconnect=false：保留重连状态（内部替换连接时使用）
+  const closeWebSocketConnectionAsync = async (tokenId: string, cancelReconnect = true) => {
+    // 取消自动重连定时器（主动断开时调用）
+    if (cancelReconnect) {
+      const rs = tokenReconnectState.value[tokenId];
+      if (rs?.timerId) {
+        clearTimeout(rs.timerId);
+      }
+      tokenReconnectState.value[tokenId] = { attempts: 0, timerId: null };
+    }
+
     const lockAcquired = await acquireConnectionLock(tokenId, "disconnect");
     if (!lockAcquired) {
       wsLogger.warn(`无法获取断开连接锁: ${tokenId}`);
@@ -1693,6 +1823,7 @@ export const useTokenStore = defineStore("tokens", () => {
     getValidGroupTokenIds,
     cleanupInvalidTokens,
     syncTokensToServer,
+    reloadTokensForCurrentUser,
 
     // 多租户
     assignToken,

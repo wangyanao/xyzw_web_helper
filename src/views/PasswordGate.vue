@@ -60,10 +60,12 @@ import { ref, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { LockClosed, PersonCircle } from '@vicons/ionicons5'
 import { useUserStore } from '@/stores/userStore'
+import { useTokenStore } from '@/stores/tokenStore'
 
 const router = useRouter()
 const route = useRoute()
 const userStore = useUserStore()
+const tokenStore = useTokenStore()
 
 const username = ref('')
 const password = ref('')
@@ -91,6 +93,8 @@ async function handleLogin() {
   if (result === true) {
     // 拉取完整用户信息（含 assignedTokenIds）
     await userStore.refreshMe()
+    // 登录后按当前用户可见范围重建 token 列表
+    await tokenStore.reloadTokensForCurrentUser()
   }
   loading.value = false
   if (result === true) {
