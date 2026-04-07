@@ -45,11 +45,15 @@ const handleThemeChange = () => {
   }, 50);
 };
 
-// iOS/移动端：页面从后台恢复时，若 WebSocket 已断则自动重连
+// iOS/移动端：页面从后台恢复时，若之前已建立的 WebSocket 连接断开则自动重连
+// 仅对本次会话中创建过连接的 Token 生效（从未连接过的不会被自动重连）
 const handleVisibilityChange = () => {
   if (document.visibilityState === "visible") {
     const tid = tokenStore.selectedTokenId;
     if (!tid) return;
+    if (tokenStore.isManuallyDisconnected(tid)) return;
+    // 只有 wsConnections 中有记录（本次会话曾经连接过）才重连
+    if (!tokenStore.wsConnections[tid]) return;
     const status = tokenStore.getWebSocketStatus(tid);
     if (status === "disconnected" || status === "error") {
       tokenStore.selectToken(tid, true);
@@ -58,10 +62,11 @@ const handleVisibilityChange = () => {
 };
 
 // iOS Safari bfcache（浏览器前进/后退缓存）恢复时，WebSocket 句柄必然失效，强制重连
+// 仅对本次会话中创建过连接的 Token 生效
 const handlePageShow = (e) => {
   if (e.persisted) {
     const tid = tokenStore.selectedTokenId;
-    if (tid) {
+    if (tid && !tokenStore.isManuallyDisconnected(tid) && tokenStore.wsConnections[tid]) {
       setTimeout(() => tokenStore.selectToken(tid, true), 100);
     }
   }
@@ -83,17 +88,12 @@ onMounted(async () => {
   // 全局初始化本地文件同步句柄（从 IndexedDB 恢复已绑定的文件）
   await fileSync.init();
 
-  // 已登录会话在应用启动时按用户可见范围重建 Token 列表
+  // 已登录会话在应用启动时按用户可见范围重建 Token 列表（仅加载列表，不自动连接）
   if (userStore.isLoggedIn) {
     await userStore.refreshMe().catch(() => {});
     await tokenStore.reloadTokensForCurrentUser();
-  } else {
-    // 无密码保护模式：刷新页面后，直接重连本地上次选中的 token
-    const tid = tokenStore.selectedTokenId;
-    if (tid) {
-      setTimeout(() => tokenStore.selectToken(tid, true), 300);
-    }
   }
+  // 页面加载时不自动连接任何 Token，由用户点击控制台/进入游戏功能页面时主动触发连接
 });
 
 onUnmounted(() => {

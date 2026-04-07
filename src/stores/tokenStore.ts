@@ -265,16 +265,6 @@ export const useTokenStore = defineStore("tokens", () => {
         selectedTokenId.value = serverTokens[0].id;
       }
 
-      // 切换账号后自动重连当前选中的 token，避免页面一直显示未连接。
-      const targetId = selectedTokenId.value || serverTokens[0]?.id;
-      if (targetId) {
-        setTimeout(() => {
-          try {
-            selectToken(targetId, true);
-          } catch {}
-        }, 50);
-      }
-
       cleanupInvalidTokens();
       return { success: true, count: serverTokens.length, scope: data?.scope || null };
     } catch (error) {
@@ -440,6 +430,19 @@ export const useTokenStore = defineStore("tokens", () => {
   // 最多重连 8 次：5s/9s/16s/29s/52s/94s/120s/120s，覆盖约 5 分钟服务器冷却期
   const MAX_AUTO_RECONNECT = 8;
 
+  // 用户主动断开的 Token 集合，阻止所有自动重连（页面刷新/visibilitychange/pageshow/指数退避）
+  // 用户重新点击连接时自动清除。持久化到 localStorage，页面刷新后仍然有效
+  const _manuallyDisconnectedArr = useLocalStorage<string[]>("manuallyDisconnectedTokens", []);
+  const manuallyDisconnectedTokens = ref(new Set<string>(_manuallyDisconnectedArr.value));
+  // 同步 Set 变化到 localStorage
+  const _syncManuallyDisconnected = () => {
+    _manuallyDisconnectedArr.value = [...manuallyDisconnectedTokens.value];
+  };
+
+  const isManuallyDisconnected = (tokenId: string) => {
+    return manuallyDisconnectedTokens.value.has(tokenId);
+  };
+
   // 尝试自动刷新Token
   const attemptTokenRefresh = async (tokenId: string, forceReconnect = false) => {
     // 检查冷却时间 (10秒)
@@ -539,6 +542,11 @@ export const useTokenStore = defineStore("tokens", () => {
         currentPath === '/admin/game-features';
       
       if (shouldReconnect) {
+        // 用户主动断开的 Token 不自动重连
+        if (manuallyDisconnectedTokens.value.has(tokenId)) {
+          wsLogger.info(`Token已被用户主动断开，刷新成功但跳过自动重连 [${tokenId}]`);
+          return true;
+        }
         wsLogger.info(`触发自动重连 [${tokenId}]`);
         // 重置重连状态以允许立即重连
         if (wsConnections.value[tokenId]) {
@@ -829,6 +837,10 @@ export const useTokenStore = defineStore("tokens", () => {
   ) => {
     wsLogger.info(`开始创建连接: ${tokenId}`);
 
+    // 用户发起连接，清除「主动断开」标记
+    manuallyDisconnectedTokens.value.delete(tokenId);
+    _syncManuallyDisconnected();
+
     // 1. 获取连接锁，防止竞态条件
     const lockAcquired = await acquireConnectionLock(tokenId, "connect");
     if (!lockAcquired) {
@@ -958,6 +970,11 @@ export const useTokenStore = defineStore("tokens", () => {
         updateCrossTabConnectionState(tokenId, "disconnected");
 
         // ---- 指数退避自动重连 ----
+        // 用户主动断开的 Token 不自动重连
+        if (manuallyDisconnectedTokens.value.has(tokenId)) {
+          wsLogger.info(`Token已被用户主动断开，跳过自动重连 [${tokenId}]`);
+          return;
+        }
         // wsConnections[tokenId] 被主动删除（closeWebSocketConnectionAsync）则说明用户主动断开，不重连
         const currConn = wsConnections.value[tokenId];
         if (!currConn) return;
@@ -967,10 +984,22 @@ export const useTokenStore = defineStore("tokens", () => {
         const rs = tokenReconnectState.value[tokenId] ?? { attempts: 0, timerId: null };
         if (rs.attempts < MAX_AUTO_RECONNECT) {
           rs.attempts++;
-          const delay = Math.min(Math.round(5000 * Math.pow(1.8, rs.attempts - 1)), 120000);
+          let delay = Math.min(Math.round(5000 * Math.pow(1.8, rs.attempts - 1)), 120000);
+          const lifeMs = currConn?.connectedAt ? Date.now() - new Date(currConn.connectedAt).getTime() : 0;
+          const isFlapping = lifeMs > 0 && lifeMs < 3000;
+          // 连接刚建立就断开，通常是同账号互踢/会话冲突，拉长下一次重连间隔避免 1s-5s 频繁抖动
+          if (isFlapping && rs.attempts >= 2) {
+            delay = Math.max(delay, 30000);
+            wsLogger.warn(`检测到连接抖动(生命周期 ${lifeMs}ms)，延长重连等待至 ${Math.round(delay / 1000)}s [${tokenId}]`);
+          }
           wsLogger.info(`断线，将在 ${Math.round(delay / 1000)}s 后第 ${rs.attempts} 次自动重连 [${tokenId}]`);
           rs.timerId = setTimeout(() => {
             rs.timerId = null;
+            // 定时器触发时再次检查：用户可能在等待期间手动断开了
+            if (manuallyDisconnectedTokens.value.has(tokenId)) {
+              wsLogger.info(`Token已被用户主动断开，取消定时重连 [${tokenId}]`);
+              return;
+            }
             const c = wsConnections.value[tokenId];
             // 连接已被主动清理或已连接，跳过
             if (!c || c.status === "connected" || c.status === "connecting") return;
@@ -1037,6 +1066,10 @@ export const useTokenStore = defineStore("tokens", () => {
         clearTimeout(rs.timerId);
       }
       tokenReconnectState.value[tokenId] = { attempts: 0, timerId: null };
+      // 标记为用户主动断开，阻止所有后续自动重连（visibilitychange/pageshow/reload/指数退避）
+      manuallyDisconnectedTokens.value.add(tokenId);
+      _syncManuallyDisconnected();
+      wsLogger.info(`标记Token为主动断开，禁止自动重连: ${tokenId}`);
     }
 
     const lockAcquired = await acquireConnectionLock(tokenId, "disconnect");
@@ -1754,6 +1787,7 @@ export const useTokenStore = defineStore("tokens", () => {
     // WebSocket方法
     createWebSocketConnection,
     closeWebSocketConnection,
+    isManuallyDisconnected,
     getWebSocketStatus,
     getWebSocketClient,
     sendMessage,

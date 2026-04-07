@@ -204,6 +204,74 @@ function decryptAuto(data) {
 }
 
 // ============================================================
+// 响应命令映射（处理服务器以独立cmd名返回而非resp字段匹配的情况）
+// key: 服务器返回的响应cmd（小写），value: 原始请求cmd
+// ============================================================
+const RESP_CMD_MAP = {
+  // 阵容
+  presetteam_saveteamresp: 'presetteam_saveteam',
+  presetteam_getinforesp: 'presetteam_getinfo',
+  // 角色信息
+  role_getroleinforesp: 'role_getroleinfo',
+  // 战斗
+  fight_startbossresp: 'fight_startboss',
+  fight_startlegionbossresp: 'fight_startlegionboss',
+  fight_startpvpresp: 'fight_startpvp',
+  fight_startareaarenaresp: 'fight_startareaarena',
+  fight_starttowerresp: 'fight_starttower',
+  // 竞技场
+  arena_startarearesp: 'arena_startarea',
+  arena_getareatargetresp: 'arena_getareatarget',
+  arena_getarearankresp: 'arena_getarearank',
+  // 招募/背包
+  hero_recruitresp: 'hero_recruit',
+  item_openboxresp: 'item_openbox',
+  item_openpackresp: 'item_openpack',
+  // 挂机/好友
+  system_claimhanguprewardresp: 'system_claimhangupreward',
+  friend_batchresp: 'friend_batch',
+  // 俱乐部
+  legion_signinresp: 'legion_signin',
+  legion_getinforesp: 'legion_getinfo',
+  // 盐罐
+  bottlehelper_claimresp: 'bottlehelper_claim',
+  bottlehelper_startresp: 'bottlehelper_start',
+  bottlehelper_stopresp: 'bottlehelper_stop',
+  // 商店/珍宝阁
+  store_buyresp: 'store_purchase',
+  collection_goodslistresp: 'collection_goodslist',
+  collection_claimfreerewardresp: 'collection_claimfreereward',
+  // 邮件
+  mail_claimallattachmentresp: 'mail_claimallattachment',
+  // 充值/特惠
+  discount_getdiscountinforesp: 'discount_getdiscountinfo',
+  // 塔
+  tower_claimrewardresp: 'tower_claimreward',
+  evotowerinforesp: 'evotower_getinfo',
+  evotower_fightresp: 'evotower_fight',
+  // 任务
+  task_claimdailyrewardresp: 'task_claimdailyreward',
+  task_claimweekrewardresp: 'task_claimweekreward',
+  // 咸王宝库
+  bosstower_getinforesp: 'bosstower_getinfo',
+  bosstower_startbossresp: 'bosstower_startboss',
+  bosstower_startboxresp: 'bosstower_startbox',
+  // 版本信息
+  system_getdatabundleverresp: 'system_getdatabundlever',
+  // 活动
+  activity_getresp: 'activity_get',
+  // 答题
+  studyresp: 'study_startgame',
+  // 同步响应（多命令共享）
+  syncresp: ['system_mysharecallback', 'task_claimdailypoint'],
+  syncrewardresp: [
+    'system_buygold', 'discount_claimreward', 'card_claimreward',
+    'artifact_lottery', 'genie_sweep', 'genie_buysweep',
+    'system_signinreward', 'dungeon_selecthero',
+  ],
+};
+
+// ============================================================
 // 游戏客户端
 // ============================================================
 
@@ -286,23 +354,41 @@ export class GameClient {
       // 更新 ack（用于心跳和下次发包）
       if (outer.seq) this._ack = outer.seq;
 
-      // 通过 resp 字段匹配等待中的 Promise
+      const _resolvePending = (pending, key) => {
+        clearTimeout(pending.timeoutId);
+        this._pending.delete(key);
+        if (outer.code && outer.code !== 0) {
+          pending.reject(new Error(`游戏错误 ${outer.code}: ${outer.hint || ''}`));
+          return;
+        }
+        let body = outer.body;
+        if (body instanceof Uint8Array && body.length > 0) {
+          try { body = bon.decode(body); } catch { /* keep raw */ }
+        }
+        pending.resolve(body ?? outer);
+      };
+
+      // 方式1：通过 resp 字段匹配等待中的 Promise
       const resp = outer.resp;
       if (resp !== undefined) {
         const pending = this._pending.get(resp);
-        if (pending) {
-          clearTimeout(pending.timeoutId);
-          this._pending.delete(resp);
-          if (outer.code && outer.code !== 0) {
-            pending.reject(new Error(`游戏错误 ${outer.code}: ${outer.hint || ''}`));
-            return;
+        if (pending) { _resolvePending(pending, resp); return; }
+      }
+
+      // 方式2：通过响应 cmd 名匹配（如 presetteam_saveteamresp -> presetteam_saveteam）
+      const respCmd = (outer.cmd || '').toLowerCase();
+      if (respCmd) {
+        // 从响应 cmd 推断原始命令名
+        const origCmd = RESP_CMD_MAP[respCmd]
+          || (respCmd.endsWith('resp') ? respCmd.slice(0, -4) : null);
+        if (origCmd) {
+          const origCmds = Array.isArray(origCmd) ? origCmd : [origCmd];
+          for (const [key, pending] of this._pending) {
+            if (origCmds.includes(pending.cmd)) {
+              _resolvePending(pending, key);
+              return;
+            }
           }
-          // 解码 body（服务器返回的 body 是 Uint8Array，需要再次 BON 解码）
-          let body = outer.body;
-          if (body instanceof Uint8Array && body.length > 0) {
-            try { body = bon.decode(body); } catch { /* keep raw */ }
-          }
-          pending.resolve(body ?? outer);
         }
       }
     } catch { /* 忽略解析错误 */ }
@@ -332,7 +418,7 @@ export class GameClient {
         reject(new Error(`超时: ${cmd}`));
       }, timeout);
 
-      this._pending.set(seq, { resolve, reject, timeoutId });
+      this._pending.set(seq, { resolve, reject, timeoutId, cmd });
       this._ws.send(Buffer.from(data), (err) => {
         if (err) {
           clearTimeout(timeoutId);

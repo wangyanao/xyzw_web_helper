@@ -359,6 +359,15 @@
                 </n-button>
                 <n-button
                   size="small"
+                  @click="batchDirectSendCar"
+                  :disabled="
+                    isRunning || selectedTokens.length === 0 || !isCarActivityOpen
+                  "
+                >
+                  直接发车
+                </n-button>
+                <n-button
+                  size="small"
                   @click="batchClaimCars"
                   :disabled="
                     isRunning || selectedTokens.length === 0 || !isCarActivityOpen
@@ -2933,7 +2942,7 @@ const taskForm = reactive({
 
 // 任务分组定义
 const taskGroupDefinitions = [
-  { name: 'daily', label: '日常', tasks: ['startBatch', 'claimHangUpRewards', 'batchAddHangUpTime', 'resetBottles', 'batchlingguanzi', 'batchclubsign', 'batchStudy', 'batcharenafight', 'batchSmartSendCar', 'batchClaimCars', 'store_purchase', 'collection_claimfreereward', 'batchGenieSweep'] },
+  { name: 'daily', label: '日常', tasks: ['startBatch', 'claimHangUpRewards', 'batchAddHangUpTime', 'resetBottles', 'batchlingguanzi', 'batchclubsign', 'batchStudy', 'batcharenafight', 'batchSmartSendCar', 'batchDirectSendCar', 'batchClaimCars', 'store_purchase', 'collection_claimfreereward', 'batchGenieSweep'] },
   { name: 'dungeon', label: '副本', tasks: ['climbTower', 'batchmengjing', 'skinChallenge', 'batchClaimPeachTasks', 'batchBuyDreamItems'] },
   { name: 'baoku', label: '宝库', tasks: ['batchbaoku13', 'batchbaoku45'] },
   { name: 'weirdTower', label: '怪异塔', tasks: ['climbWeirdTower', 'batchUseItems', 'batchMergeItems', 'batchClaimFreeEnergy'] },
@@ -3956,7 +3965,7 @@ const executeScheduledTask = async (task) => {
       }
 
       if (
-        ["batchSmartSendCar", "batchClaimCars"].includes(taskName) &&
+        ["batchSmartSendCar", "batchDirectSendCar", "batchClaimCars"].includes(taskName) &&
         !isCarActivityOpen.value
       ) {
         addLog({
@@ -5146,7 +5155,7 @@ const tasksTower = createTasksTower(createTaskDeps());
 const { climbTower, climbWeirdTower, batchClaimFreeEnergy, skinChallenge, batchUseItems, batchMergeItems } = tasksTower;
 
 const tasksCar = createTasksCar(createTaskDeps());
-const { batchSmartSendCar, batchClaimCars } = tasksCar;
+const { batchSmartSendCar, batchDirectSendCar, batchClaimCars } = tasksCar;
 
 const tasksItem = createTasksItem(createTaskDeps());
 const {

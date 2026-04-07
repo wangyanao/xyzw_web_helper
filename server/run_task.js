@@ -251,6 +251,31 @@ function applyResilientSendWrapper(client, tokenName, getActiveToken, maxRetries
   client._resilientSendWrapped = true;
 }
 
+// 「今日已完成」类错误码，视为正常完成而非失败
+const ALREADY_DONE_CODES = new Set([
+  2300190,   // 今天已经签到过了
+  12000116,  // 今日已领取免费奖励
+  1000020,   // 今天已经领取过奖励了
+  700020,    // 已经领取过这个任务
+  400190,    // 没有可领取的签到奖励
+  3500020,   // 没有可领取的奖励
+  12000050,  // 今日发车次数已达上限
+  3300050,   // 今日免费扫荡券已领取
+]);
+
+// 「条件不满足」类错误码，静默跳过
+const SKIP_CODES = new Set([
+  1400010,   // 没有购买该月卡
+  2300070,   // 未加入俱乐部
+  200160,    // 模块未开启
+  -10006,    // 功能未就绪/不可用
+]);
+
+function extractErrorCode(errMsg) {
+  const m = String(errMsg).match(/游戏错误\s+(-?\d+)/);
+  return m ? Number(m[1]) : null;
+}
+
 // ============================================================
 // 单个命令执行（带容错）
 // ============================================================
@@ -260,6 +285,15 @@ async function execCmd(client, tokenName, cmd, params = {}, desc = '', timeout =
     log(tokenName, `✅ ${desc || cmd}`, 'success');
     return result;
   } catch (err) {
+    const code = extractErrorCode(err.message);
+    if (code !== null && ALREADY_DONE_CODES.has(code)) {
+      log(tokenName, `✅ ${desc || cmd}（今日已完成）`, 'success');
+      return null;
+    }
+    if (code !== null && SKIP_CODES.has(code)) {
+      log(tokenName, `⊘ ${desc || cmd}（条件不满足，跳过）`, 'info');
+      return null;
+    }
     log(tokenName, `⚠️  ${desc || cmd} 失败: ${err.message}`, 'warning');
     return null;
   }
@@ -277,7 +311,13 @@ async function runDailyBasic(client, tokenName, delay = 500) {
   // ── 1. 获取角色信息（判断任务完成状态）──
   let roleData = null;
   try {
-    const res = await client.sendWithPromise('role_getroleinfo', {}, 10000);
+    const res = await client.sendWithPromise('role_getroleinfo', {
+      clientVersion: '2.10.3-f10a39eaa0c409f4-wx',
+      inviteUid: 0,
+      platform: 'hortor',
+      platformExt: 'mix',
+      scene: '',
+    }, 10000);
     roleData = res?.role || null;
   } catch (e) {
     log(tokenName, `获取角色信息失败: ${e.message}，仍继续执行`, 'warning');
@@ -309,7 +349,7 @@ async function runDailyBasic(client, tokenName, delay = 500) {
   if (!isTaskDone(3))
     await execCmd(client, tokenName, 'friend_batch', { friendId: 0 }, '赠送好友金币'); await sleep(delay);
   if (!isTaskDone(4)) {
-    await execCmd(client, tokenName, 'hero_recruit', { recruitType: 3, recruitNumber: 1 }, '免费招募'); await sleep(delay);
+    await execCmd(client, tokenName, 'hero_recruit', { byClub: false, recruitType: 3, recruitNumber: 1 }, '免费招募'); await sleep(delay);
   }
   if (!isTaskDone(6) && isTodayAvail(statisticsTime['buy:gold'])) {
     for (let i = 0; i < 3; i++) {
@@ -330,15 +370,33 @@ async function runDailyBasic(client, tokenName, delay = 500) {
   await execCmd(client, tokenName, 'bottlehelper_stop',  { bottleType: -1 }, '停止盐罐计时'); await sleep(delay);
   await execCmd(client, tokenName, 'bottlehelper_start', { bottleType: -1 }, '开始盐罐计时'); await sleep(delay);
   if (!isTaskDone(14))
-    await execCmd(client, tokenName, 'bottlehelper_claim', { bottleType: -1 }, '领取盐罐奖励'); await sleep(delay);
+    await execCmd(client, tokenName, 'bottlehelper_claim', {}, '领取盐罐奖励'); await sleep(delay);
+
+  // ── 4b. 每日咸王考验（每天打 3 次 BOSS）──
+  const DAY_BOSS_MAP = [9904, 9905, 9901, 9902, 9903, 9904, 9905]; // 周日~周六
+  const todayBossId = DAY_BOSS_MAP[new Date().getDay()];
+  // 切换到 BOSS 阵容（默认阵容 2）
+  const bossFormation = 2;
+  if (originalFormation !== null && originalFormation !== bossFormation) {
+    await client.sendWithPromise('presetteam_saveteam', { teamId: bossFormation }, 5000).catch(() => {});
+    log(tokenName, `切换到BOSS阵容 ${bossFormation}`, 'info');
+    await sleep(delay);
+  }
+  for (let i = 0; i < 3; i++) {
+    await execCmd(client, tokenName, 'fight_startboss', { bossId: todayBossId, battleVersion }, `每日咸王考验 ${i+1}/3`); await sleep(delay);
+  }
 
   // ── 5. 固定奖励 ──
+  // 预热：先查询充值/特惠信息，部分游戏服务器要求先「打开页面」才允许领取
+  await client.sendWithPromise('discount_getdiscountinfo', {}, 5000).catch(() => {});
+  await sleep(delay);
+
   const fixedCmds = [
     { cmd: 'system_signinreward',         params: {},                desc: '福利签到' },
     { cmd: 'legion_signin',               params: {},                desc: '俱乐部签到' },
-    { cmd: 'discount_claimreward',        params: {},                desc: '领取每日礼包' },
+    { cmd: 'discount_claimreward',        params: { discountId: 1 }, desc: '领取每日礼包' },
     { cmd: 'collection_claimfreereward',  params: {},                desc: '领取每日免费奖励' },
-    { cmd: 'card_claimreward',            params: {},                desc: '领取免费礼包' },
+    { cmd: 'card_claimreward',            params: { cardId: 1 },     desc: '领取免费礼包' },
     { cmd: 'card_claimreward',            params: { cardId: 4003 }, desc: '领取永久卡礼包' },
     { cmd: 'mail_claimallattachment',     params: { category: 0 },  desc: '领取邮件奖励' },
     { cmd: 'collection_goodslist',        params: {},                desc: '刷新珍宝阁' },
@@ -366,7 +424,7 @@ async function runDailyBasic(client, tokenName, delay = 500) {
 
   // ── 7. 黑市 ──
   if (!isTaskDone(12))
-    await execCmd(client, tokenName, 'store_purchase', {}, '黑市购买'); await sleep(delay);
+    await execCmd(client, tokenName, 'store_purchase', { goodsId: 1 }, '黑市购买'); await sleep(delay);
 
   // ── 8. 咸王梦境（周日/一/三/四）──
   const dow = new Date().getDay();
@@ -381,48 +439,14 @@ async function runDailyBasic(client, tokenName, delay = 500) {
     await sleep(delay);
   }
 
-  // ── 10. 任务积分 + 日常/周常/通行证奖励（关键：前端最后一步）──
-  // 注：任务积分对应关系
-  // taskId 1-2: 基础任务（分享、赠送）
-  // taskId 3-4: 竞技场/爬塔
-  // taskId 5-6: 活动相关
-  // 只有当任务完成 (dailyTask.complete[taskId] === -1) 才能领取
-  const taskIdToCondition = {
-    1: 2,   // 分享游戏
-    2: 3,   // 赠送好友
-    3: 4,   // 免费招募
-    4: 6,   // 免费点金
-    5: 5,   // 领取挂机
-    6: 7,   // 开启宝箱
-    7: 12,  // 黑市购买
-    8: 14,  // 盐罐相关
-    9: null, // 可能是竞技场或其他
-    10: null // 可能是活动或其他
-  };
-
+  // ── 10. 任务积分 + 日常/周常/通行证奖励（对齐前端逻辑：直接尝试全部领取，失败则跳过）──
   for (let taskId = 1; taskId <= 10; taskId++) {
-    try {
-      // 对于已知的任务条件，先检查是否完成；对于未知的，直接尝试领取
-      const conditionId = taskIdToCondition[taskId];
-      if (conditionId !== null && !isTaskDone(conditionId)) {
-        log(tokenName, `⊘ 任务积分 ${taskId}/10 尚未达成完成条件，跳过`, 'info');
-        continue;
-      }
-      
-      await execCmd(client, tokenName, 'task_claimdailypoint', { taskId }, `领取任务积分 ${taskId}/10`);
-      await sleep(delay);
-    } catch (err) {
-      // 700010 错误表示任务未完成，直接跳过不打印错误
-      if (err.message?.includes('700010')) {
-        log(tokenName, `⊘ 任务积分 ${taskId}/10 尚未达成完成条件，跳过`, 'info');
-      } else {
-        log(tokenName, `⚠️  领取任务积分 ${taskId}/10 失败: ${err.message}`, 'warning');
-      }
-    }
+    await execCmd(client, tokenName, 'task_claimdailypoint', { taskId }, `领取任务积分 ${taskId}/10`);
+    await sleep(delay);
   }
 
-  await execCmd(client, tokenName, 'task_claimdailyreward', {}, '领取日常任务奖励箱'); await sleep(delay);
-  await execCmd(client, tokenName, 'task_claimweekreward',  {}, '领取周常任务奖励箱'); await sleep(delay);
+  await execCmd(client, tokenName, 'task_claimdailyreward', { rewardId: 0 }, '领取日常任务奖励箱'); await sleep(delay);
+  await execCmd(client, tokenName, 'task_claimweekreward',  { rewardId: 0 }, '领取周常任务奖励箱'); await sleep(delay);
   await execCmd(client, tokenName, 'activity_recyclewarorderrewardclaim', { actId: 1 }, '领取通行证奖励'); await sleep(delay);
 }
 
@@ -458,7 +482,7 @@ async function runResetBottles(client, tokenName, delay = 500) {
 
 /** 一键领取盐罐 */
 async function runClaimBottle(client, tokenName) {
-  await execCmd(client, tokenName, 'bottlehelper_claim', { bottleType: -1 }, '一键领取盐罐');
+  await execCmd(client, tokenName, 'bottlehelper_claim', {}, '一键领取盐罐');
 }
 
 /** 领取功法残卷挂机奖励 */
@@ -1092,6 +1116,30 @@ async function runSmartSendCar(client, tokenName, settings = {}, delay = 500) {
     }
     log(tokenName, `✅ 智能发车完成，共发 ${sent} 辆`, 'success');
   } catch (err) { log(tokenName, `智能发车失败: ${err.message}`, 'warning'); }
+}
+
+/** 直接发车（不判断条件、不刷新，获取车辆后直接发出所有未发送的车） */
+async function runDirectSendCar(client, tokenName, delay = 500) {
+  try {
+    const res = await client.sendWithPromise('car_getrolecar', {}, 10000);
+    const cars = normalizeCars(res);
+    log(tokenName, `直接发车：共找到 ${cars.length} 辆车`);
+
+    let sent = 0;
+    for (const car of cars) {
+      const sendAt = Number(car.sendAt ?? car.sendtime ?? car.send_at ?? 0);
+      if (sendAt !== 0) {
+        log(tokenName, `车辆[${gradeLabel(car.color)}] 已在路上，跳过`);
+        continue;
+      }
+      await execCmd(client, tokenName, 'car_send',
+        { carId: String(car.id), helperId: 0, text: '', isUpgrade: false },
+        `直接发车[${gradeLabel(car.color)}]`, 10000);
+      sent++;
+      await sleep(delay);
+    }
+    log(tokenName, `✅ 直接发车完成，共发 ${sent} 辆`, 'success');
+  } catch (err) { log(tokenName, `直接发车失败: ${err.message}`, 'warning'); }
 }
 
 /** 批量开箱 */
@@ -1734,6 +1782,7 @@ const TASK_RUNNERS = {
   batchClaimFreeEnergy:     (c, n)    => runClaimFreeEnergy(c, n),
   // ── 刷新类（refreshDelay）──
   batchSmartSendCar:        (c, n, s) => runSmartSendCar(c, n, s, s.refreshDelay || s.commandDelay),
+  batchDirectSendCar:       (c, n, s) => runDirectSendCar(c, n, s.commandDelay),
   batchClaimCars:           (c, n, s) => runClaimCars(c, n, s.commandDelay),
   batchGenieSweep:          (c, n, s) => runGenieSweep(c, n, s.refreshDelay || s.commandDelay),
   batchTopUpFish:           (c, n, s) => runTopUpFish(c, n, s.commandDelay),

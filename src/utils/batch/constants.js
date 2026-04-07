@@ -39,6 +39,7 @@ export const availableTasks = [
   { label: "一键爬怪异塔", value: "climbWeirdTower" },
   { label: "一键答题", value: "batchStudy" },
   { label: "智能发车", value: "batchSmartSendCar" },
+  { label: "直接发车", value: "batchDirectSendCar" },
   { label: "一键收车", value: "batchClaimCars" },
   { label: "批量开箱", value: "batchOpenBox" },
   { label: "按积分开箱", value: "batchOpenBoxByPoints" },

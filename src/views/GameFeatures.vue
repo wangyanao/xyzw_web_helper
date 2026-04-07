@@ -213,10 +213,13 @@ const connectWebSocket = () => {
 
   try {
     const tokenId = tokenStore.selectedToken.id;
-    const token = tokenStore.selectedToken.token;
+    const status = tokenStore.getWebSocketStatus(tokenId);
+    if (status === "connecting") {
+      return;
+    }
 
-    // 使用 tokenStore 的 WebSocket 连接管理
-    tokenStore.createWebSocketConnection(tokenId, token);
+    // 统一走 tokenStore 的选择/重连逻辑，避免页面层直接重复建连
+    tokenStore.selectToken(tokenId, true);
     message.info("正在建立 WebSocket 连接...");
 
     // 等待连接建立
@@ -257,9 +260,9 @@ onMounted(() => {
   // 检查是否需要连接 WebSocket
   if (tokenStore.selectedToken) {
     const status = tokenStore.getWebSocketStatus(tokenStore.selectedToken.id);
-    if (status !== "connected") {
+    if (status === "disconnected" || status === "error") {
       connectWebSocket();
-    } else {
+    } else if (status === "connected") {
       // 如果已连接，立即获取初始数据
       initializeGameData();
     }

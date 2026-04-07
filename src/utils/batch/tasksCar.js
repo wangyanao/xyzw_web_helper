@@ -595,8 +595,80 @@ export function createTasksCar(deps) {
     message.success("批量一键收车结束");
   };
 
+  /**
+   * 直接发车（不判断条件、不刷新，直接发出所有未发送的车）
+   */
+  const batchDirectSendCar = async () => {
+    if (selectedTokens.value.length === 0) return;
+
+    isRunning.value = true;
+    shouldStop.value = false;
+
+    selectedTokens.value.forEach((id) => {
+      tokenStatus.value[id] = "waiting";
+    });
+
+    const taskPromises = selectedTokens.value.map(async (tokenId) => {
+      if (shouldStop.value) return;
+
+      const token = tokens.value.find((t) => t.id === tokenId);
+      const tokenName = token?.name || tokenId;
+
+      tokenStatus.value[tokenId] = "running";
+      currentRunningTokenId.value = tokenId;
+
+      let client;
+      try {
+        client = await ensureConnection(tokenId);
+        if (!client) throw new Error("连接失败");
+
+        addLog(tokenId, `开始直接发车...`);
+
+        const res = await client.sendWithPromise("car_getrolecar", {}, 10000);
+        const cars = normalizeCars(res);
+        addLog(tokenId, `共找到 ${cars.length} 辆车`);
+
+        let sent = 0;
+        for (const car of cars) {
+          if (shouldStop.value) break;
+          const sendAt = Number(car.sendAt ?? car.sendtime ?? car.send_at ?? 0);
+          if (sendAt !== 0) {
+            addLog(tokenId, `车辆[${gradeLabel(car.color)}] 已在路上，跳过`);
+            continue;
+          }
+
+          try {
+            await client.sendWithPromise("car_send",
+              { carId: String(car.id), helperId: 0, text: "", isUpgrade: false },
+              10000);
+            addLog(tokenId, `✅ 直接发车[${gradeLabel(car.color)}]`, "success");
+            sent++;
+          } catch (e) {
+            addLog(tokenId, `⚠️ 发车失败[${gradeLabel(car.color)}]: ${e.message}`, "warning");
+          }
+          await new Promise((r) => setTimeout(r, delayConfig.value.commandDelay || 500));
+        }
+
+        addLog(tokenId, `直接发车完成，共发 ${sent} 辆`, "success");
+        tokenStatus.value[tokenId] = "done";
+      } catch (err) {
+        addLog(tokenId, `直接发车失败: ${err.message}`, "error");
+        tokenStatus.value[tokenId] = "error";
+      } finally {
+        releaseConnectionSlot?.();
+      }
+    });
+
+    await Promise.all(taskPromises);
+
+    isRunning.value = false;
+    currentRunningTokenId.value = null;
+    message.success("批量直接发车结束");
+  };
+
   return {
     batchSmartSendCar,
+    batchDirectSendCar,
     batchClaimCars,
   };
 }

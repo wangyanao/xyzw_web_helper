@@ -598,13 +598,13 @@ export class DailyTaskRunner {
       });
     }
 
-    // 咸王梦境
+    // 咸王梦境（周日/周一/周三/周四）
     const mengyandayOfWeek = new Date().getDay();
     if (
-      (mengyandayOfWeek === 0) |
-      (mengyandayOfWeek === 1) |
-      (mengyandayOfWeek === 3) |
-      (mengyandayOfWeek === 4)
+      mengyandayOfWeek === 0 ||
+      mengyandayOfWeek === 1 ||
+      mengyandayOfWeek === 3 ||
+      mengyandayOfWeek === 4
     ) {
       const mjbattleTeam = { 0: 107 };
       taskList.push({

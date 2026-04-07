@@ -446,6 +446,8 @@ export class XyzwWebSocketClient {
     this.showMsg = false;
     this.connected = false;
     this.isReconnecting = false; // 重连状态标志
+    // 重连策略由 tokenStore 统一管理，避免底层 1s 自重连与上层退避重连互相打架
+    this.reconnectOnSendWhenDisconnected = false;
 
     this.promises = Object.create(null);
     this.registry = registerDefaultCommands(
@@ -806,14 +808,18 @@ export class XyzwWebSocketClient {
   send(cmd, params = {}, options = {}) {
     if (!this.connected) {
       wsLogger.warn(`WebSocket 未连接，消息已入队: ${cmd}`);
-      // 防止频繁重连
-      if (!this.dialogStatus && !this.isReconnecting) {
-        this.dialogStatus = true;
-        wsLogger.info("自动触发重连...");
-        this.reconnect();
-        setTimeout(() => {
-          this.dialogStatus = false;
-        }, 2000);
+      // 默认关闭底层 send 触发重连，避免重连风暴；仅在显式开启时使用旧行为
+      if (this.reconnectOnSendWhenDisconnected) {
+        if (!this.dialogStatus && !this.isReconnecting) {
+          this.dialogStatus = true;
+          wsLogger.info("自动触发重连...");
+          this.reconnect();
+          setTimeout(() => {
+            this.dialogStatus = false;
+          }, 2000);
+        }
+      } else {
+        return null;
       }
     }
 
@@ -843,8 +849,8 @@ export class XyzwWebSocketClient {
   /** Promise 版发送 */
   sendWithPromise(cmd, params = {}, timeoutMs = 5000) {
     return new Promise((resolve, reject) => {
-      if (!this.connected && !this.socket) {
-        return reject(new Error("WebSocket 连接已关闭"));
+      if (!this.connected) {
+        return reject(new Error("WebSocket 未连接"));
       }
 
       // 为此请求生成唯一的seq值
