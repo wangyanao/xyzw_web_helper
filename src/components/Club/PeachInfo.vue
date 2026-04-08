@@ -1141,65 +1141,40 @@ const fetchBattleInfo = async () => {
     let killRes;
     const shortDate = formatDateToShort(queryDate.value);
 
-    // Time-based Logic
-    // If selected date is today AND it is currently battle time, fetch live data
-    if (queryDate.value === getLastSunday() && isSundayBattleTime()) {
-      // Sunday 18:00-20:30: Use legion_getpayloadbf
-      const res = await tokenStore.sendMessageWithPromise(
-        tokenId,
-        "legion_getpayloadbf",
-        {},
-        10000
-      );
-      if (!res || !res.legions) {
-        message.error("未获取到战场信息");
-        loading.value = false;
-        return;
-      }
-      ownLegionId = club.value.id;
-      opponentLegionId = res.legions[0].id;
-      if (ownLegionId === opponentLegionId) {
-        opponentLegionId = res.legions[1].id;
-      }
-      if (!opponentLegionId) {
-        message.error("未获取到对战俱乐部ID");
-        return;
-      }
-    } else {
-      // Other times: Use legion_getpayloadrecord + legion_getpayloadkillrecord
-      // 1. Get Task (for own ID reference, though not strictly needed if we trust the map)
-      const taskRes = await tokenStore.sendMessageWithPromise(
-        tokenId,
-        "legion_getpayloadtask",
-        {},
-        10000
-      );
+    // 先按日期记录查询对手，避免周日 18 点后仅依赖实时接口导致短时查空。
+    ownLegionId = club.value.id;
+    const recordRes = await tokenStore.sendMessageWithPromise(
+      tokenId,
+      "legion_getpayloadrecord",
+      {},
+      10000
+    );
+    const mappedRecord = recordRes?.enemyLegionMap?.[shortDate];
+    if (mappedRecord?.id) {
+      opponentLegionId = mappedRecord.id;
+    }
 
-      // 2. Get Record Map
-      ownLegionId = club.value.id;
-      const res = await tokenStore.sendMessageWithPromise(
-        tokenId,
-        "legion_getpayloadrecord",
-        {},
-        10000
-      );
-      if (!res || !res.enemyLegionMap) {
-        message.warning("未获取到历史对战记录");
-        loading.value = false;
-        return;
+    // 若日期映射尚未落地，再回退实时战场接口。
+    if (!opponentLegionId) {
+      const shouldUseLiveFallback = queryDate.value === getLastSunday() && isSundayBattleTime();
+      if (shouldUseLiveFallback) {
+        const bfRes = await tokenStore.sendMessageWithPromise(
+          tokenId,
+          "legion_getpayloadbf",
+          {},
+          10000
+        );
+        const legions = Array.isArray(bfRes?.legions) ? bfRes.legions : [];
+        const ownIdNum = Number(ownLegionId);
+        const candidate = legions.find((item) => Number(item?.id) !== ownIdNum && Number(item?.id) > 0);
+        opponentLegionId = candidate?.id;
       }
-      const record = res.enemyLegionMap[shortDate];
-      if (record) {
-        opponentLegionId = record.id;
-      } else {
-        message.warning(`未找到 ${queryDate.value} 的对战记录`);
-        loading.value = false;
-        return;
-      }
-      if (!opponentLegionId) {
-        message.error("未获取到对战俱乐部ID");
-        return;
-      }
+    }
+
+    if (!opponentLegionId) {
+      message.warning("暂未获取到匹配俱乐部信息，请稍后刷新");
+      loading.value = false;
+      return;
     }
 
 
@@ -1246,7 +1221,7 @@ const fetchBattleInfo = async () => {
         logo: ownLegionIdInfo?.legionData?.logo || '',
         quenchNum: ownLegionIdInfo?.legionData?.quenchNum || 0,
         announcement: ownLegionIdInfo?.legionData?.announcement || '',
-        memberCount: killRes.recordsMap[ownLegionId]?.length || 0,
+        memberCount: killRes?.recordsMap?.[ownLegionId]?.length || 0,
       },
       opponentClub: {
         id: opponentLegionId,
@@ -1257,7 +1232,7 @@ const fetchBattleInfo = async () => {
         logo: clubInfoRes?.legionData?.logo || '',
         quenchNum: clubInfoRes?.legionData?.quenchNum || 0,
         announcement: clubInfoRes?.legionData?.announcement || '',
-        memberCount: killRes.recordsMap[opponentLegionId]?.length || 0,
+        memberCount: killRes?.recordsMap?.[opponentLegionId]?.length || 0,
       }
     }
 

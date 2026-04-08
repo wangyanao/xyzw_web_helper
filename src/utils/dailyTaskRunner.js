@@ -244,16 +244,19 @@ export class DailyTaskRunner {
     }
 
     if (!isTaskCompleted(4)) {
-      taskList.push({
-        name: "免费招募",
-        execute: () =>
-          this.executeGameCommand(
-            tokenId,
-            "hero_recruit",
-            { recruitType: 3, recruitNumber: 1 },
-            "免费招募",
-          ),
-      });
+      // 免费招募需要点2次
+      for (let i = 0; i < 2; i++) {
+        taskList.push({
+          name: `免费招募 ${i + 1}/2`,
+          execute: () =>
+            this.executeGameCommand(
+              tokenId,
+              "hero_recruit",
+              { recruitType: 3, recruitNumber: 1 },
+              `免费招募 ${i + 1}/2`,
+            ),
+        });
+      }
 
       if (settings.payRecruit) {
         taskList.push({
@@ -659,6 +662,21 @@ export class DailyTaskRunner {
             "task_claimdailypoint",
             { taskId },
             `领取任务奖励${taskId}`,
+            5000,
+          ),
+      });
+    }
+
+    // 竞技场任务奖励（taskId 13）
+    if (!isTaskCompleted(13)) {
+      taskList.push({
+        name: "领取任务奖励13（竞技场）",
+        execute: () =>
+          this.executeGameCommand(
+            tokenId,
+            "task_claimdailypoint",
+            { taskId: 13 },
+            "领取任务奖励13",
             5000,
           ),
       });

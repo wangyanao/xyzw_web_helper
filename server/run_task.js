@@ -863,26 +863,89 @@ async function runClaimPeachTasks(client, tokenName, delay = 500) {
 
 /** 梦境购买（使用 batchSettings.dreamPurchaseList）*/
 async function runBuyDreamItems(client, tokenName, batchSettings = {}, delay = 500) {
-  const purchaseList = batchSettings.dreamPurchaseList || [];
+  const rawPurchaseList = batchSettings?.dreamPurchaseList;
+  const purchaseList = Array.isArray(rawPurchaseList) ? rawPurchaseList : [];
   if (!purchaseList.length) { log(tokenName, '梦境购买：未配置购买清单', 'warning'); return; }
   const dayOfWeek = new Date().getDay();
   if (![0, 1, 3, 4].includes(dayOfWeek)) {
     log(tokenName, `梦境购买：今日非开放日`, 'warning'); return;
   }
+
+  const parsePurchaseKey = (item) => {
+    if (typeof item === 'string') {
+      const [merchantId, itemIndex] = item.split('-').map(Number);
+      if (!Number.isNaN(merchantId) && !Number.isNaN(itemIndex)) {
+        return { merchantId, itemIndex };
+      }
+      return null;
+    }
+    if (item && typeof item === 'object') {
+      const merchantId = Number(item.merchantId ?? item.id);
+      const itemIndex = Number(item.itemIndex ?? item.index);
+      if (!Number.isNaN(merchantId) && !Number.isNaN(itemIndex)) {
+        return { merchantId, itemIndex };
+      }
+    }
+    return null;
+  };
+
   try {
     const roleInfo = await client.sendWithPromise('role_getroleinfo', {}, 15000);
     const merchantData = roleInfo?.role?.dungeon?.merchant;
     if (!merchantData) { log(tokenName, '梦境购买：无法获取商店数据', 'warning'); return; }
-    for (const itemKey of purchaseList) {
-      const [mId, idx] = itemKey.split('-').map(Number);
-      const items = merchantData[mId] || [];
+
+    const levelId = Number(roleInfo?.role?.levelId || 0);
+    if (levelId < 4000) {
+      log(tokenName, `梦境购买：关卡 ${levelId} < 4000，跳过`, 'warning');
+      return;
+    }
+
+    const operations = [];
+    for (const rawItem of purchaseList) {
+      const parsed = parsePurchaseKey(rawItem);
+      if (!parsed) continue;
+
+      const { merchantId, itemIndex } = parsed;
+      const items = merchantData[merchantId];
+      if (!Array.isArray(items)) continue;
+
       for (let pos = 0; pos < items.length; pos++) {
-        if (items[pos] === idx) {
-          await execCmd(client, tokenName, 'dungeon_buymerchant', { id: mId, index: idx, pos }, `梦境购买 ${mId}-${idx}`, 5000);
-          await sleep(delay);
+        if (items[pos] === itemIndex) {
+          operations.push({ merchantId, itemIndex, pos });
         }
       }
     }
+
+    if (!operations.length) {
+      log(tokenName, '梦境购买：配置商品未在当前商店中出现', 'warning');
+      return;
+    }
+
+    // 同商人内按 pos 倒序购买，避免前面购买后列表位移导致买错商品。
+    operations.sort((a, b) => {
+      if (a.merchantId !== b.merchantId) return a.merchantId - b.merchantId;
+      return b.pos - a.pos;
+    });
+
+    let successCount = 0;
+    let failCount = 0;
+    for (const op of operations) {
+      const result = await execCmd(
+        client,
+        tokenName,
+        'dungeon_buymerchant',
+        { id: op.merchantId, index: op.itemIndex, pos: op.pos },
+        `梦境购买 ${op.merchantId}-${op.itemIndex}`,
+        5000,
+      );
+
+      if (result && result.reward) successCount++;
+      else failCount++;
+
+      await sleep(delay);
+    }
+
+    log(tokenName, `梦境购买完成：成功 ${successCount}，失败 ${failCount}`, 'info');
   } catch (err) { log(tokenName, `梦境购买失败: ${err.message}`, 'warning'); }
 }
 
