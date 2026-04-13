@@ -307,7 +307,19 @@ async function execCmd(client, tokenName, cmd, params = {}, desc = '', timeout =
  * 完整日常任务（对齐前端 DailyTaskRunner.run() 逻辑）
  * 包含：基础操作、固定奖励、钓鱼/灯神免费次数、任务积分/箱子领取
  */
-async function runDailyBasic(client, tokenName, delay = 500) {
+/**
+ * 完整日常任务（对齐前端 DailyTaskRunner.run() 逻辑）
+ * 支持 Token 级别的开关配置（payRecruit 等）
+ */
+async function runDailyBasic(client, tokenName, delay = 500, batchSettings = {}) {
+  // 提取功能开关（默认都启用）
+  const claimBottle = batchSettings.claimBottle ?? true;
+  const claimHangUp = batchSettings.claimHangUp ?? true;
+  const openBox = batchSettings.openBox ?? true;
+  const claimEmail = batchSettings.claimEmail ?? true;
+  const blackMarketPurchase = batchSettings.blackMarketPurchase ?? true;
+  const arenaEnable = batchSettings.arenaEnable ?? true;
+  
   // ── 1. 获取角色信息（判断任务完成状态）──
   let roleData = null;
   try {
@@ -349,37 +361,91 @@ async function runDailyBasic(client, tokenName, delay = 500) {
   if (!isTaskDone(3))
     await execCmd(client, tokenName, 'friend_batch', { friendId: 0 }, '赠送好友金币'); await sleep(delay);
   if (!isTaskDone(4)) {
-    await execCmd(client, tokenName, 'hero_recruit', { byClub: false, recruitType: 3, recruitNumber: 1 }, '免费招募'); await sleep(delay);
+    // 实际规则：免费招募每天仅 1 次
+    await execCmd(
+      client,
+      tokenName,
+      'hero_recruit',
+      { byClub: false, recruitType: 3, recruitNumber: 1 },
+      '免费招募 1/1'
+    );
+    await sleep(delay);
+
+    // Token 级配置开启时，再执行 1 次付费招募
+    if (batchSettings.payRecruit === true || batchSettings.payRecruit === 1) {
+      await execCmd(
+        client,
+        tokenName,
+        'hero_recruit',
+        { byClub: false, recruitType: 1, recruitNumber: 1 },
+        '付费招募 1/1'
+      );
+      await sleep(delay);
+    }
   }
   if (!isTaskDone(6) && isTodayAvail(statisticsTime['buy:gold'])) {
     for (let i = 0; i < 3; i++) {
       await execCmd(client, tokenName, 'system_buygold', { buyNum: 1 }, `免费点金 ${i+1}/3`); await sleep(delay);
     }
   }
-  if (!isTaskDone(5)) {
+  
+  // 领取挂机（读取 claimHangUp 开关）
+  if (claimHangUp && !isTaskDone(5)) {
     await execCmd(client, tokenName, 'system_claimhangupreward', {}, '领取挂机奖励'); await sleep(delay);
     for (let i = 0; i < 4; i++) {
       await execCmd(client, tokenName, 'system_mysharecallback', { isSkipShareCard: true, type: 2 }, `挂机加钟 ${i+1}/4`); await sleep(delay);
     }
   }
-  if (!isTaskDone(7)) {
+  
+  // 开箱（读取 openBox 开关）
+  if (openBox && !isTaskDone(7)) {
     await execCmd(client, tokenName, 'item_openbox', { itemId: 2001, number: 10 }, '开启木质宝箱'); await sleep(delay);
   }
 
-  // 重置罐子
+  // 重置罐子 + 领取盐罐（claimBottle 开关）
   await execCmd(client, tokenName, 'bottlehelper_stop',  { bottleType: -1 }, '停止盐罐计时'); await sleep(delay);
   await execCmd(client, tokenName, 'bottlehelper_start', { bottleType: -1 }, '开始盐罐计时'); await sleep(delay);
-  if (!isTaskDone(14))
+  if (claimBottle && !isTaskDone(14)) {
     await execCmd(client, tokenName, 'bottlehelper_claim', {}, '领取盐罐奖励'); await sleep(delay);
+  }
 
-  // ── 4b. 每日咸王考验（每天打 3 次 BOSS）──
+  // ── 4b. 俱乐部BOSS（根据前端配置 bossTimes）──
+  const bossTimes = Number(batchSettings.bossTimes ?? 2);  // 默认 2 次
+  const bossFormation = Number(batchSettings.bossFormation ?? 2);  // 默认阵容 2
+  
+  if (bossTimes > 0) {
+    // 获取已打次数
+    let alreadyBoss = Number(statistics['legion:boss'] ?? 0);
+    // 如果统计时间在今天，则重置为 0
+    if (isTodayAvail(statisticsTime['legion:boss'])) {
+      alreadyBoss = 0;
+    }
+    const remainingBoss = Math.max(bossTimes - alreadyBoss, 0);
+    
+    if (remainingBoss > 0) {
+      // 切换到 BOSS 阵容
+      if (originalFormation !== null && originalFormation !== bossFormation) {
+        await client.sendWithPromise('presetteam_saveteam', { teamId: bossFormation }, 5000).catch(() => {});
+        log(tokenName, `切换到俱乐部BOSS阵容 ${bossFormation}`, 'info');
+        await sleep(delay);
+      }
+      
+      // 打俱乐部BOSS
+      for (let i = 0; i < remainingBoss; i++) {
+        await execCmd(client, tokenName, 'fight_startlegionboss', {}, `俱乐部BOSS ${i+1}/${remainingBoss}`);
+        await sleep(delay);
+      }
+    }
+  }
+
+  // ── 4c. 每日咸王考验（每天打 3 次 BOSS）──
   const DAY_BOSS_MAP = [9904, 9905, 9901, 9902, 9903, 9904, 9905]; // 周日~周六
   const todayBossId = DAY_BOSS_MAP[new Date().getDay()];
   // 切换到 BOSS 阵容（默认阵容 2）
-  const bossFormation = 2;
-  if (originalFormation !== null && originalFormation !== bossFormation) {
-    await client.sendWithPromise('presetteam_saveteam', { teamId: bossFormation }, 5000).catch(() => {});
-    log(tokenName, `切换到BOSS阵容 ${bossFormation}`, 'info');
+  const xianwangBossFormation = 2;
+  if (originalFormation !== null && originalFormation !== xianwangBossFormation) {
+    await client.sendWithPromise('presetteam_saveteam', { teamId: xianwangBossFormation }, 5000).catch(() => {});
+    log(tokenName, `切换到咸王BOSS阵容 ${xianwangBossFormation}`, 'info');
     await sleep(delay);
   }
   for (let i = 0; i < 3; i++) {
@@ -398,12 +464,15 @@ async function runDailyBasic(client, tokenName, delay = 500) {
     { cmd: 'collection_claimfreereward',  params: {},                desc: '领取每日免费奖励' },
     { cmd: 'card_claimreward',            params: { cardId: 1 },     desc: '领取免费礼包' },
     { cmd: 'card_claimreward',            params: { cardId: 4003 }, desc: '领取永久卡礼包' },
-    { cmd: 'mail_claimallattachment',     params: { category: 0 },  desc: '领取邮件奖励' },
+    // 领取邮件（读取 claimEmail 开关）
+    { cmd: 'mail_claimallattachment',     params: { category: 0 },  desc: '领取邮件奖励', conditional: claimEmail },
     { cmd: 'collection_goodslist',        params: {},                desc: '刷新珍宝阁' },
     { cmd: 'collection_claimfreereward',  params: {},                desc: '领取珍宝阁免费礼包' },
   ];
-  for (const { cmd, params, desc } of fixedCmds) {
-    await execCmd(client, tokenName, cmd, params, desc); await sleep(delay);
+  for (const { cmd, params, desc, conditional } of fixedCmds) {
+    if (conditional !== false) {  // 默认执行或根据开关判断
+      await execCmd(client, tokenName, cmd, params, desc); await sleep(delay);
+    }
   }
 
   // ── 6. 免费活动（钓鱼/灯神）──
@@ -422,9 +491,10 @@ async function runDailyBasic(client, tokenName, delay = 500) {
     await execCmd(client, tokenName, 'genie_buysweep', {}, `领取免费扫荡券 ${i+1}/3`); await sleep(delay);
   }
 
-  // ── 7. 黑市 ──
-  if (!isTaskDone(12))
+  // ── 7. 黑市（读取 blackMarketPurchase 开关）──
+  if (blackMarketPurchase && !isTaskDone(12)) {
     await execCmd(client, tokenName, 'store_purchase', { goodsId: 1 }, '黑市购买'); await sleep(delay);
+  }
 
   // ── 8. 咸王梦境（周日/一/三/四）──
   const dow = new Date().getDay();
@@ -432,14 +502,19 @@ async function runDailyBasic(client, tokenName, delay = 500) {
     await execCmd(client, tokenName, 'dungeon_selecthero', { battleTeam: { 0: 107 } }, '咸王梦境'); await sleep(delay);
   }
 
-  // ── 9. 恢复原阵容 ──
+  // ── 9. 竞技场PK（需在任务积分领取前执行，避免积分判定时机过早）──
+  if (arenaEnable) {
+    await runArenaFight(client, tokenName, batchSettings, delay);
+  }
+
+  // ── 10. 恢复原阵容 ──
   if (originalFormation !== null) {
     await client.sendWithPromise('presetteam_saveteam', { teamId: originalFormation }, 5000).catch(() => {});
     log(tokenName, `已恢复原阵容 ${originalFormation}`);
     await sleep(delay);
   }
 
-  // ── 10. 任务积分 + 日常/周常/通行证奖励（对齐前端逻辑：直接尝试全部领取，失败则跳过）──
+  // ── 11. 任务积分 + 日常/周常/通行证奖励（对齐前端逻辑：直接尝试全部领取，失败则跳过）──
   for (let taskId = 1; taskId <= 10; taskId++) {
     await execCmd(client, tokenName, 'task_claimdailypoint', { taskId }, `领取任务积分 ${taskId}/10`);
     await sleep(delay);
@@ -1369,7 +1444,10 @@ async function runBatchFish(client, tokenName, batchSettings = {}, delay = 500) 
 /** 批量招募 */
 async function runBatchRecruit(client, tokenName, batchSettings = {}, delay = 500) {
   const totalCount = batchSettings.recruitCount ?? 100;
-  log(tokenName, `批量招募：${totalCount} 次`);
+  const payRecruit = batchSettings.payRecruit ?? false;  // 是否执行付费招募
+  const doPay = payRecruit === true || payRecruit === 1;  // 容错处理
+  
+  log(tokenName, `批量招募：${totalCount} 次 (付费招募: ${doPay ? '启用' : '禁用'})`);
   try {
     const batches = Math.floor(totalCount / 10);
     const remainder = totalCount % 10;
@@ -1380,6 +1458,13 @@ async function runBatchRecruit(client, tokenName, batchSettings = {}, delay = 50
     if (remainder > 0) {
       await execCmd(client, tokenName, 'hero_recruit', { recruitType: 1, recruitNumber: remainder }, `招募 ${totalCount}/${totalCount}`);
     }
+    
+    // 付费招募（额外1次）
+    if (doPay) {
+      await execCmd(client, tokenName, 'hero_recruit', { recruitType: 3, recruitNumber: 1 }, `付费招募 1/1`);
+      await sleep(delay);
+    }
+    
     log(tokenName, `✅ 批量招募完成`, 'success');
   } catch (err) { log(tokenName, `批量招募失败: ${err.message}`, 'warning'); }
 }
@@ -1812,7 +1897,7 @@ async function runHeroLevelUpgrade(client, tokenName, heroId, targetLevel = 6000
  */
 const TASK_RUNNERS = {
   // ── 日常（commandDelay）──
-  startBatch:               (c, n, s) => runDailyBasic(c, n, s.commandDelay),
+  startBatch:               (c, n, s) => runDailyBasic(c, n, s.commandDelay, s),
   claimHangUpRewards:       (c, n)    => runClaimHangUp(c, n),
   batchclubsign:            (c, n)    => runClubSign(c, n),
   collection_claimfreereward:(c, n)   => runCollectionFree(c, n),
@@ -1898,13 +1983,27 @@ async function main() {
       continue;
     }
 
-    // 合并 per-token 设置（如 arenaFormation）到 batchSettings
+    // 合并 per-token 设置到 batchSettings（Token级别配置优先级高于全局配置）
     const perTokenSettings = tokenSettings[tokenId] || {};
     const mergedSettings = { ...batchSettings };
-    // per-token 设置覆盖全局设置（仅覆盖 per-token 特有的字段）
+    // per-token 设置覆盖全局设置
+    // 1. 阵容配置
     if (perTokenSettings.arenaFormation != null) mergedSettings.arenaFormation = perTokenSettings.arenaFormation;
     if (perTokenSettings.towerFormation != null) mergedSettings.towerFormation = perTokenSettings.towerFormation;
     if (perTokenSettings.bossFormation != null) mergedSettings.bossFormation = perTokenSettings.bossFormation;
+    // 2. 任务次数/数量配置
+    if (perTokenSettings.bossTimes != null) mergedSettings.bossTimes = perTokenSettings.bossTimes;
+    if (perTokenSettings.boxCount != null) mergedSettings.boxCount = perTokenSettings.boxCount;
+    if (perTokenSettings.fishCount != null) mergedSettings.fishCount = perTokenSettings.fishCount;
+    if (perTokenSettings.recruitCount != null) mergedSettings.recruitCount = perTokenSettings.recruitCount;
+    // 3. 功能开关配置
+    if (perTokenSettings.payRecruit != null) mergedSettings.payRecruit = perTokenSettings.payRecruit;
+    if (perTokenSettings.claimBottle != null) mergedSettings.claimBottle = perTokenSettings.claimBottle;
+    if (perTokenSettings.claimHangUp != null) mergedSettings.claimHangUp = perTokenSettings.claimHangUp;
+    if (perTokenSettings.arenaEnable != null) mergedSettings.arenaEnable = perTokenSettings.arenaEnable;
+    if (perTokenSettings.openBox != null) mergedSettings.openBox = perTokenSettings.openBox;
+    if (perTokenSettings.claimEmail != null) mergedSettings.claimEmail = perTokenSettings.claimEmail;
+    if (perTokenSettings.blackMarketPurchase != null) mergedSettings.blackMarketPurchase = perTokenSettings.blackMarketPurchase;
 
     const client = new GameClient({
       log: (msg, level) => log(tokenName, msg, level),

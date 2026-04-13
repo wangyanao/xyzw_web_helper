@@ -220,9 +220,13 @@ export const useTokenStore = defineStore("tokens", () => {
     for (const t of gameTokens.value) {
       tokenMap[t.id] = { id: t.id, name: t.name, token: t.token, server: t.server || '', importMethod: t.importMethod || 'manual' };
     }
+    const sessionToken = sessionStorage.getItem(SESSION_KEY) || "";
     fetch('/api/tokens/sync', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(sessionToken ? { 'X-Session-Token': sessionToken } : {}),
+      },
       body: JSON.stringify(tokenMap),
     }).catch(() => { /* 服务端不可用时静默忽略 */ });
   };
@@ -356,7 +360,11 @@ export const useTokenStore = defineStore("tokens", () => {
     await deleteArrayBuffer(tokenId);
 
     // 通知服务端删除该 token（合并模式下 sync 不再自动删除）
-    fetch(`/api/tokens/${encodeURIComponent(tokenId)}`, { method: 'DELETE' }).catch(() => {});
+    const sessionToken = sessionStorage.getItem(SESSION_KEY) || "";
+    fetch(`/api/tokens/${encodeURIComponent(tokenId)}`, {
+      method: 'DELETE',
+      headers: sessionToken ? { 'X-Session-Token': sessionToken } : {},
+    }).catch(() => {});
 
     syncTokensToServer();
     return true;

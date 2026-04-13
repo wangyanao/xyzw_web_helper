@@ -736,8 +736,11 @@ const extractRoleIdFromToken = (tokenStr) => {
 
 const fetchLineupsFromBackend = async (tokenId) => {
   const url = `${LINEUPS_API_BASE}/${encodeURIComponent(String(tokenId))}`;
+  const sessionToken = sessionStorage.getItem("xyzw_session_token") || "";
 
-  const resp = await fetch(url);
+  const resp = await fetch(url, {
+    headers: sessionToken ? { "X-Session-Token": sessionToken } : {},
+  });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const data = await resp.json();
   return Array.isArray(data?.lineups) ? data.lineups : [];
@@ -1459,11 +1462,15 @@ const saveLineupsToStorage = async () => {
   saveLineupsToLocal();
 
   try {
+    const sessionToken = sessionStorage.getItem("xyzw_session_token") || "";
     const resp = await fetch(
       `${LINEUPS_API_BASE}/${encodeURIComponent(String(token.id))}`,
       {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(sessionToken ? { "X-Session-Token": sessionToken } : {}),
+        },
         body: JSON.stringify({ lineups: savedLineups.value }),
       },
     );

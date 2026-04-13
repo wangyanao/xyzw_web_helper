@@ -27,7 +27,34 @@ def now_shanghai():
     return datetime.now(TZ_SHANGHAI)
 
 app = Flask(__name__)
-CORS(app)
+
+def _parse_cors_origins() -> list:
+    """从环境变量读取 CORS 白名单，返回去重后的 origin 列表。"""
+    default_origins = [
+        'https://wangyanao.top:30001',
+        'https://wangyanao.top',
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+        'http://localhost:5173',
+        'http://127.0.0.1:5173',
+    ]
+    raw = os.environ.get('CORS_ALLOWED_ORIGINS', ','.join(default_origins))
+    origins = [item.strip() for item in raw.split(',') if item.strip()]
+    # 保持顺序去重，避免重复配置
+    return list(dict.fromkeys(origins))
+
+
+CORS(
+    app,
+    resources={
+        r'/api/*': {
+            'origins': _parse_cors_origins(),
+            'supports_credentials': True,
+            'allow_headers': ['Content-Type', 'X-Session-Token', 'X-Upload-Secret'],
+            'methods': ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+        }
+    },
+)
 
 # ===== 存储目录 =====
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -679,12 +706,14 @@ def _add_job(task):
 # ===== 定时任务 API =====
 
 @app.route('/api/tasks', methods=['GET'])
+@require_auth
 def get_tasks():
     """获取所有定时任务"""
     return jsonify(load_tasks())
 
 
 @app.route('/api/tasks/sync', methods=['POST'])
+@require_admin
 def sync_tasks():
     """
     前端同步全量任务列表到服务器
@@ -711,6 +740,7 @@ def sync_tasks():
 
 
 @app.route('/api/tasks/<task_id>', methods=['DELETE'])
+@require_admin
 def delete_task(task_id):
     """删除指定任务"""
     tasks = load_tasks()
@@ -725,6 +755,7 @@ def delete_task(task_id):
 
 
 @app.route('/api/tasks/<task_id>/trigger', methods=['POST'])
+@require_admin
 def trigger_task(task_id):
     """立即手动触发一次指定任务（测试用）"""
     tasks = load_tasks()
@@ -740,6 +771,7 @@ def trigger_task(task_id):
 # ===== Token 同步 API =====
 
 @app.route('/api/tokens/sync', methods=['POST'])
+@require_auth
 def sync_tokens():
     """
     前端同步 token 数据到服务器（供定时任务使用）
@@ -774,6 +806,7 @@ def sync_tokens():
 
 
 @app.route('/api/tokens/<token_id>', methods=['DELETE'])
+@require_auth
 def delete_token(token_id):
     """从服务端 tokens.json 中删除指定 token"""
     tokens = load_tokens()
@@ -785,6 +818,7 @@ def delete_token(token_id):
 
 
 @app.route('/api/tokens', methods=['GET'])
+@require_auth
 def get_tokens():
     """返回已存储的 token 列表（脱敏，不返回 token 字段）"""
     tokens = load_tokens()
@@ -826,6 +860,7 @@ def get_full_tokens_for_current_user():
 
 
 @app.route('/api/lineups/<token_id>', methods=['GET'])
+@require_auth
 def get_lineups(token_id):
     """按 tokenId 或 roleId 获取已保存阵容"""
     if not token_id:
@@ -882,6 +917,7 @@ def get_lineups(token_id):
 
 
 @app.route('/api/lineups/<token_id>', methods=['PUT'])
+@require_auth
 def put_lineups(token_id):
     """按 tokenId 全量覆盖保存阵容"""
     if not token_id:
@@ -918,6 +954,7 @@ def put_lineups(token_id):
 
 
 @app.route('/api/lineups/<token_id>', methods=['DELETE'])
+@require_auth
 def delete_lineups(token_id):
     """按 tokenId 删除已保存阵容"""
     if not token_id:
@@ -930,6 +967,7 @@ def delete_lineups(token_id):
 
 
 @app.route('/api/scheduler/jobs', methods=['GET'])
+@require_admin
 def list_scheduler_jobs():
     """查看 APScheduler 当前注册的所有 job"""
     jobs = []
@@ -952,6 +990,20 @@ def _load_and_schedule_all():
         except Exception as e:
             print(f'[scheduler] 加载任务 {task.get("name")} 失败: {e}')
     print(f'[scheduler] 已加载 {len(tasks)} 个定时任务')
+
+
+_scheduler_bootstrapped = False
+
+
+def _bootstrap_scheduler_once():
+    """确保调度器只启动一次"""
+    global _scheduler_bootstrapped
+    if _scheduler_bootstrapped:
+        return
+    _load_and_schedule_all()
+    scheduler.start()
+    _scheduler_bootstrapped = True
+    print(f'[scheduler] APScheduler 已启动', flush=True)
 
 
 if __name__ == '__main__':
@@ -982,8 +1034,7 @@ if __name__ == '__main__':
         print(f'[bin_map] 已补全 bin_map.json，共 {len(bin_map)} 条记录')
 
     # 启动定时任务调度器
-    _load_and_schedule_all()
-    scheduler.start()
-    print(f'[scheduler] APScheduler 已启动', flush=True)
+    _bootstrap_scheduler_once()
 
+    # 本地直接运行时仍保留 Flask 启动方式
     app.run(host='0.0.0.0', port=port, debug=False)

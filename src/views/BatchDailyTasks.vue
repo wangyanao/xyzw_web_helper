@@ -3038,9 +3038,16 @@ const saveScheduledTasks = () => {
 };
 
 // 从服务器拉取任务，合并到本地（服务器有而本地没有的追加进来）
+const schedulerSessionHeaders = () => {
+  const sessionToken = sessionStorage.getItem("xyzw_session_token") || "";
+  return sessionToken ? { "X-Session-Token": sessionToken } : {};
+};
+
 const pullTasksFromServer = async () => {
   try {
-    const res = await fetch("/api/tasks");
+    const res = await fetch("/api/tasks", {
+      headers: schedulerSessionHeaders(),
+    });
     if (!res.ok) return;
     const serverTasks = await res.json();
     if (!Array.isArray(serverTasks) || serverTasks.length === 0) return;
@@ -3085,7 +3092,10 @@ const syncTasksToServer = async (tasks) => {
     }));
     const res = await fetch("/api/tasks/sync", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...schedulerSessionHeaders(),
+      },
       body: JSON.stringify(tasksWithSettings),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
