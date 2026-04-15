@@ -601,8 +601,40 @@ const pearlMap = ref({});
 let lastRefreshTime = 0;
 const REFRESH_DEBOUNCE = 3000;
 const COMMAND_DELAY = 500;
+const TOO_FAST_RETRY_DELAY = 1500;
+const TOO_FAST_MAX_RETRIES = 2;
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const isTooFastError = (error) =>
+  String(error?.message || "").includes("200400");
+
+const sendMessageWithRetry = async (
+  tokenId,
+  cmd,
+  params = {},
+  timeout,
+  retries = TOO_FAST_MAX_RETRIES,
+) => {
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      if (timeout !== undefined) {
+        return await tokenStore.sendMessageWithPromise(tokenId, cmd, params, timeout);
+      }
+      return await tokenStore.sendMessageWithPromise(tokenId, cmd, params);
+    } catch (error) {
+      lastError = error;
+      if (!isTooFastError(error) || attempt === retries) {
+        throw error;
+      }
+      await delay(TOO_FAST_RETRY_DELAY * (attempt + 1));
+    }
+  }
+
+  throw lastError;
+};
 
 const formatPower = (power) => {
   if (!power) return "0";
@@ -1503,12 +1535,11 @@ const refreshTeamInfo = async () => {
 
   loading.value = true;
   try {
-    let presetTeamResult = await tokenStore.sendMessageWithPromise(
+    const presetTeamResult = await sendMessageWithRetry(
       tokenId,
       "presetteam_getinfo",
       {},
     );
-
     const teamsFromGame =
       presetTeamResult?.presetTeamInfo?.presetTeamInfo || {};
     const gameTeamIds = Object.keys(teamsFromGame)
@@ -1524,33 +1555,7 @@ const refreshTeamInfo = async () => {
       targetTeamId = availableTeamIds[0];
     }
 
-    const currentIndex = availableTeamIds.indexOf(targetTeamId);
-    const otherTeamId =
-      availableTeamIds[currentIndex === 0 ? 1 : currentIndex - 1] ||
-      availableTeamIds[0];
-
-    if (otherTeamId !== targetTeamId && availableTeamIds.length > 1) {
-      await tokenStore.sendMessageWithPromise(tokenId, "presetteam_saveteam", {
-        teamId: otherTeamId,
-      });
-
-      await delay(COMMAND_DELAY);
-
-      await tokenStore.sendMessageWithPromise(tokenId, "presetteam_saveteam", {
-        teamId: targetTeamId,
-      });
-
-      await delay(COMMAND_DELAY);
-    }
-
-    presetTeamResult = await tokenStore.sendMessageWithPromise(
-      tokenId,
-      "presetteam_getinfo",
-      {},
-    );
-    await delay(COMMAND_DELAY);
-
-    const roleInfo = await tokenStore.sendMessageWithPromise(
+    const roleInfo = await sendMessageWithRetry(
       tokenId,
       "role_getroleinfo",
       {},
@@ -1762,7 +1767,7 @@ const applyHeroLevel = async (
   if (actualCurrentLevel > targetLevel) {
     if (slot >= 0) {
       try {
-        await tokenStore.sendMessageWithPromise(tokenId, "hero_gobackbattle", {
+        await sendMessageWithRetry(tokenId, "hero_gobackbattle", {
           slot,
         });
       } catch (err) {}
@@ -1770,7 +1775,7 @@ const applyHeroLevel = async (
     }
 
     try {
-      const result = await tokenStore.sendMessageWithPromise(
+      const result = await sendMessageWithRetry(
         tokenId,
         "hero_rebirth",
         {
@@ -1792,7 +1797,7 @@ const applyHeroLevel = async (
 
     if (slot >= 0) {
       try {
-        await tokenStore.sendMessageWithPromise(tokenId, "hero_gointobattle", {
+        await sendMessageWithRetry(tokenId, "hero_gointobattle", {
           heroId,
           slot,
         });
@@ -1804,7 +1809,7 @@ const applyHeroLevel = async (
   const expectedOrder = getOrder(actualCurrentLevel);
   if (actualCurrentOrder < expectedOrder) {
     try {
-      const result = await tokenStore.sendMessageWithPromise(
+      const result = await sendMessageWithRetry(
         tokenId,
         "hero_heroupgradeorder",
         {
@@ -1841,7 +1846,7 @@ const applyHeroLevel = async (
     }
 
     try {
-      await tokenStore.sendMessageWithPromise(
+      await sendMessageWithRetry(
         tokenId,
         "hero_heroupgradelevel",
         {
@@ -1855,7 +1860,7 @@ const applyHeroLevel = async (
 
     if (nextOrderLevel && actualCurrentLevel >= nextOrderLevel) {
       try {
-        const result = await tokenStore.sendMessageWithPromise(
+        const result = await sendMessageWithRetry(
           tokenId,
           "hero_heroupgradeorder",
           {
@@ -1925,13 +1930,13 @@ const applyLineup = async (lineup) => {
   };
 
   const fetchLatestData = async (teamId = null) => {
-    const roleInfo = await tokenStore.sendMessageWithPromise(
+    const roleInfo = await sendMessageWithRetry(
       tokenId,
       "role_getroleinfo",
       {},
     );
     await delay(COMMAND_DELAY);
-    const presetTeam = await tokenStore.sendMessageWithPromise(
+    const presetTeam = await sendMessageWithRetry(
       tokenId,
       "presetteam_getinfo",
       {},
@@ -1989,6 +1994,7 @@ const applyLineup = async (lineup) => {
           const emptySlot = currentHeroes.length < 5 ? currentHeroes.length : 0;
           try {
             await tokenStore.sendMessageWithPromise(
+            await sendMessageWithRetry(
               tokenId,
               "hero_gointobattle",
               {
@@ -2003,6 +2009,7 @@ const applyLineup = async (lineup) => {
 
           try {
             await tokenStore.sendMessageWithPromise(
+            await sendMessageWithRetry(
               tokenId,
               "hero_gointobattle",
               {
@@ -2015,7 +2022,7 @@ const applyLineup = async (lineup) => {
         }
 
         try {
-          await tokenStore.sendMessageWithPromise(tokenId, "hero_exchange", {
+          await sendMessageWithRetry(tokenId, "hero_exchange", {
             heroId: currentHolderId,
             targetHeroId: targetHero.heroId,
           });
@@ -2040,7 +2047,7 @@ const applyLineup = async (lineup) => {
     for (const hero of [...currentHeroes]) {
       if (!targetHeroIds.has(hero.heroId)) {
         try {
-          await tokenStore.sendMessageWithPromise(
+          await sendMessageWithRetry(
             tokenId,
             "hero_gobackbattle",
             {
@@ -2063,7 +2070,7 @@ const applyLineup = async (lineup) => {
       );
       if (!currentHero) {
         try {
-          await tokenStore.sendMessageWithPromise(
+          await sendMessageWithRetry(
             tokenId,
             "hero_gointobattle",
             {
@@ -2075,7 +2082,7 @@ const applyLineup = async (lineup) => {
         await delay(COMMAND_DELAY);
       } else if (currentHero.position !== targetHero.position) {
         try {
-          await tokenStore.sendMessageWithPromise(
+          await sendMessageWithRetry(
             tokenId,
             "hero_gobackbattle",
             {
@@ -2084,7 +2091,7 @@ const applyLineup = async (lineup) => {
           );
           await delay(COMMAND_DELAY);
           try {
-            await tokenStore.sendMessageWithPromise(
+            await sendMessageWithRetry(
               tokenId,
               "hero_gointobattle",
               {
@@ -2189,7 +2196,7 @@ const applyLineup = async (lineup) => {
 
         if (currentHolderId) {
           try {
-            await tokenStore.sendMessageWithPromise(
+            await sendMessageWithRetry(
               tokenId,
               "artifact_unload",
               {
@@ -2201,7 +2208,7 @@ const applyLineup = async (lineup) => {
         }
 
         try {
-          await tokenStore.sendMessageWithPromise(tokenId, "artifact_load", {
+          await sendMessageWithRetry(tokenId, "artifact_load", {
             heroId: targetHero.heroId,
             itemId: artifactId,
             pearlId: pearlId,
@@ -2235,7 +2242,7 @@ const applyLineup = async (lineup) => {
         if (!targetSkillId) {
           if (currentSkillId) {
             try {
-              await tokenStore.sendMessageWithPromise(
+              await sendMessageWithRetry(
                 tokenId,
                 "pearl_unloadskill",
                 {
@@ -2262,7 +2269,7 @@ const applyLineup = async (lineup) => {
 
         if (holderPearlId && !processedPearlIds.has(Number(holderPearlId))) {
           try {
-            await tokenStore.sendMessageWithPromise(
+            await sendMessageWithRetry(
               tokenId,
               "pearl_exchangeskill",
               {
@@ -2277,7 +2284,7 @@ const applyLineup = async (lineup) => {
           await delay(COMMAND_DELAY);
         } else {
           try {
-            await tokenStore.sendMessageWithPromise(
+            await sendMessageWithRetry(
               tokenId,
               "pearl_replaceskill",
               {
@@ -2314,7 +2321,7 @@ const applyLineup = async (lineup) => {
     }
 
     if (sourceLineup.weaponId !== undefined && sourceLineup.weaponId !== null) {
-      const currentPresetTeam = await tokenStore.sendMessageWithPromise(
+      const currentPresetTeam = await sendMessageWithRetry(
         tokenId,
         "presetteam_getinfo",
         {},
@@ -2330,7 +2337,7 @@ const applyLineup = async (lineup) => {
 
       if (currentWeaponId !== sourceLineup.weaponId) {
         try {
-          await tokenStore.sendMessageWithPromise(
+          await sendMessageWithRetry(
             tokenId,
             "lordweapon_changedefaultweapon",
             {
@@ -2583,15 +2590,16 @@ const switchTeam = async (teamId) => {
   state.value.isRunning = true;
 
   try {
-    await tokenStore.sendMessageWithPromise(tokenId, "presetteam_saveteam", {
+    await sendMessageWithRetry(tokenId, "presetteam_saveteam", {
       teamId,
     });
 
-    await delay(500);
+    await delay(TOO_FAST_RETRY_DELAY);
 
     currentTeamId.value = teamId;
     message.success(`已切换到阵容 ${teamId}`);
 
+    lastRefreshTime = 0;
     await refreshTeamInfo();
   } catch (error) {
     message.error(`切换阵容失败: ${error.message}`);
