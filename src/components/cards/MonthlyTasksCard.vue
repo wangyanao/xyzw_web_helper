@@ -144,8 +144,11 @@ const isArenaActivityOpen = computed(() => {
   return hour >= 6 && hour < 22;
 });
 
-const fetchMonthlyActivity = async () => {
-  if (!tokenStore.selectedToken) return message.warning("请先选择Token");
+const fetchMonthlyActivity = async ({ silent = false } = {}) => {
+  if (!tokenStore.selectedToken) {
+    if (!silent) message.warning("请先选择Token");
+    return;
+  }
   if (!isConnected.value) return;
   monthLoading.value = true;
   try {
@@ -154,13 +157,13 @@ const fetchMonthlyActivity = async () => {
       tokenId,
       "activity_get",
       {},
-      10000,
+      5000,
     );
     const act = result?.activity || result?.body?.activity || result;
     monthActivity.value = act || null;
-    if (act) message.success("月度任务进度已更新");
+    if (act && !silent) message.success("月度任务进度已更新");
   } catch (e) {
-    message.error(`获取月度任务失败：${e.message}`);
+    if (!silent) message.error(`获取月度任务失败：${e.message}`);
   } finally {
     monthLoading.value = false;
   }
@@ -362,14 +365,14 @@ watch(
   (status) => {
     if (status === "connected" && !hasFetchedOnce.value) {
       hasFetchedOnce.value = true;
-      fetchMonthlyActivity();
+      fetchMonthlyActivity({ silent: true });
     }
   },
   { immediate: true },
 );
 
 onMounted(() => {
-  if (tokenStore.selectedToken && isConnected.value) fetchMonthlyActivity();
+  if (tokenStore.selectedToken && isConnected.value) fetchMonthlyActivity({ silent: true });
 });
 
 defineExpose({ fetchMonthlyActivity });

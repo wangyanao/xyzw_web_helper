@@ -600,9 +600,9 @@ const artifactBooks = ref({});
 const pearlMap = ref({});
 let lastRefreshTime = 0;
 const REFRESH_DEBOUNCE = 3000;
-const COMMAND_DELAY = 500;
-const TOO_FAST_RETRY_DELAY = 1500;
-const TOO_FAST_MAX_RETRIES = 2;
+const COMMAND_DELAY = 800;
+const TOO_FAST_RETRY_DELAY = 2000;
+const TOO_FAST_MAX_RETRIES = 3;
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -1513,7 +1513,7 @@ const saveLineupsToStorage = async () => {
   }
 };
 
-const refreshTeamInfo = async () => {
+const refreshTeamInfo = async ({ keepTeamId } = {}) => {
   const now = Date.now();
   if (now - lastRefreshTime < REFRESH_DEBOUNCE) {
     return;
@@ -1580,7 +1580,10 @@ const refreshTeamInfo = async () => {
 
     if (presetTeamData.value) {
       const updatedTeamsFromGame = presetTeamData.value.presetTeamInfo || {};
-      currentTeamId.value = presetTeamData.value.useTeamId || 1;
+      const resolvedTeamId = keepTeamId && availableTeamIds.includes(keepTeamId)
+        ? keepTeamId
+        : (presetTeamData.value.useTeamId || 1);
+      currentTeamId.value = resolvedTeamId;
       availableTeams.value = availableTeamIds;
 
       const currentTeam =
@@ -1993,7 +1996,6 @@ const applyLineup = async (lineup) => {
         if (!holderInTeam && !targetInTeam) {
           const emptySlot = currentHeroes.length < 5 ? currentHeroes.length : 0;
           try {
-            await tokenStore.sendMessageWithPromise(
             await sendMessageWithRetry(
               tokenId,
               "hero_gointobattle",
@@ -2008,7 +2010,6 @@ const applyLineup = async (lineup) => {
           await delay(COMMAND_DELAY);
 
           try {
-            await tokenStore.sendMessageWithPromise(
             await sendMessageWithRetry(
               tokenId,
               "hero_gointobattle",
@@ -2060,50 +2061,134 @@ const applyLineup = async (lineup) => {
     }
 
     await delay(COMMAND_DELAY);
-    const data2 = await fetchLatestData();
-    await delay(COMMAND_DELAY);
-    currentHeroes = getTeamHeroes(data2.teamInfo);
 
+    // 用本地 slotMap 追踪阵容状态，避免每步都 fetch 服务器
+    // slotMap: position -> heroId, heroSlot: heroId -> position
+    const slotMap = {};
+    const heroSlot = {};
+    for (const h of currentHeroes) {
+      slotMap[h.position] = h.heroId;
+      heroSlot[h.heroId] = h.position;
+    }
+
+    // 构建目标映射
+    const targetSlotMap = {};
+    for (const t of targetHeroes) {
+      targetSlotMap[t.position] = t.heroId;
+    }
+
+    // 分类：已在正确位置 / 在阵中但需换位 / 不在阵中需上阵
+    const alreadyCorrect = [];
+    const needReposition = [];
+    const needEnter = [];
     for (const targetHero of targetHeroes) {
-      const currentHero = currentHeroes.find(
-        (h) => h.heroId === targetHero.heroId,
-      );
-      if (!currentHero) {
+      const curPos = heroSlot[targetHero.heroId];
+      if (curPos === targetHero.position) {
+        alreadyCorrect.push(targetHero);
+      } else if (curPos !== undefined) {
+        needReposition.push(targetHero);
+      } else {
+        needEnter.push(targetHero);
+      }
+    }
+
+    // 先把需要换位 / 上阵的武将，如果当前占着别人的目标位，先全部下阵
+    // 这样一轮下阵后再一轮上阵，减少冲突
+    const heroesToRemoveFirst = [];
+    for (const targetHero of [...needReposition, ...needEnter]) {
+      const occupantId = slotMap[targetHero.position];
+      if (occupantId && occupantId !== targetHero.heroId) {
+        // 占位者如果本身也是目标武将且已在正确位置则跳过
+        if (!alreadyCorrect.some((h) => h.heroId === occupantId)) {
+          if (!heroesToRemoveFirst.includes(targetHero.position)) {
+            heroesToRemoveFirst.push(targetHero.position);
+          }
+        }
+      }
+    }
+    // 需要换位的武将，先下阵腾出位置
+    for (const hero of needReposition) {
+      const curPos = heroSlot[hero.heroId];
+      if (curPos !== undefined && !heroesToRemoveFirst.includes(curPos)) {
+        heroesToRemoveFirst.push(curPos);
+      }
+    }
+
+    // 批量下阵
+    for (const slot of heroesToRemoveFirst) {
+      const heroId = slotMap[slot];
+      if (!heroId) continue;
+      try {
+        await sendMessageWithRetry(tokenId, "hero_gobackbattle", { slot });
+      } catch (err) {}
+      delete heroSlot[heroId];
+      delete slotMap[slot];
+      await delay(COMMAND_DELAY);
+    }
+
+    // 批量上阵（先处理不在阵中的，再处理需换位的）
+    for (const targetHero of [...needEnter, ...needReposition]) {
+      const targetPos = targetHero.position;
+
+      // 再次检查目标位是否被占（可能被前面的上阵操作占了）
+      const occupantId = slotMap[targetPos];
+      if (occupantId && occupantId !== targetHero.heroId) {
         try {
-          await sendMessageWithRetry(
-            tokenId,
-            "hero_gointobattle",
-            {
-              heroId: targetHero.heroId,
-              slot: targetHero.position,
-            },
-          );
+          await sendMessageWithRetry(tokenId, "hero_gobackbattle", { slot: targetPos });
         } catch (err) {}
+        delete heroSlot[occupantId];
+        delete slotMap[targetPos];
         await delay(COMMAND_DELAY);
-      } else if (currentHero.position !== targetHero.position) {
+      }
+
+      // 如果该武将还在其他位置（不太可能走到这里，保险起见）
+      const curPos = heroSlot[targetHero.heroId];
+      if (curPos !== undefined && curPos !== targetPos) {
         try {
-          await sendMessageWithRetry(
-            tokenId,
-            "hero_gobackbattle",
-            {
-              slot: currentHero.position,
-            },
-          );
-          await delay(COMMAND_DELAY);
-          try {
-            await sendMessageWithRetry(
-              tokenId,
-              "hero_gointobattle",
-              {
-                heroId: targetHero.heroId,
-                slot: targetHero.position,
-              },
-            );
-          } catch (err) {}
-          await delay(COMMAND_DELAY);
+          await sendMessageWithRetry(tokenId, "hero_gobackbattle", { slot: curPos });
+        } catch (err) {}
+        delete slotMap[curPos];
+        delete heroSlot[targetHero.heroId];
+        await delay(COMMAND_DELAY);
+      }
+
+      try {
+        await sendMessageWithRetry(tokenId, "hero_gointobattle", {
+          heroId: targetHero.heroId,
+          slot: targetPos,
+        });
+        slotMap[targetPos] = targetHero.heroId;
+        heroSlot[targetHero.heroId] = targetPos;
+      } catch (err) {}
+      await delay(COMMAND_DELAY);
+    }
+
+    // 最终校验：fetch 一次确认，补漏
+    await delay(COMMAND_DELAY);
+    const finalPlacement = await fetchLatestData();
+    const finalHeroes = getTeamHeroes(finalPlacement.teamInfo);
+    const finalHeroIds = new Set(finalHeroes.map((h) => h.heroId));
+    const missingTargetHeroes = targetHeroes.filter(
+      (hero) => !finalHeroIds.has(hero.heroId),
+    );
+
+    for (const targetHero of missingTargetHeroes) {
+      const occupant = finalHeroes.find((h) => h.position === targetHero.position);
+      if (occupant && occupant.heroId !== targetHero.heroId) {
+        try {
+          await sendMessageWithRetry(tokenId, "hero_gobackbattle", {
+            slot: targetHero.position,
+          });
         } catch (err) {}
         await delay(COMMAND_DELAY);
       }
+      try {
+        await sendMessageWithRetry(tokenId, "hero_gointobattle", {
+          heroId: targetHero.heroId,
+          slot: targetHero.position,
+        });
+      } catch (err) {}
+      await delay(COMMAND_DELAY);
     }
 
     const hasLevelData = lineup.heroes.some((h) => h.level && h.level > 0);
@@ -2353,7 +2438,34 @@ const applyLineup = async (lineup) => {
     }
 
     lastRefreshTime = 0;
-    await refreshTeamInfo();
+    await delay(COMMAND_DELAY);
+
+    // 关键：presetteam_saveteam 的语义是"保存当前战斗阵容到当前槽位，再切到目标槽位"
+    // 如果目标槽位 == 当前槽位，服务器认为无需操作，不会保存
+    // 所以必须：先切到一个临时阵容（触发保存当前战斗阵容），再切回来
+    const myTeamId = currentTeamId.value;
+    const tempTeamId = availableTeams.value.find((t) => t !== myTeamId)
+      || (myTeamId === 1 ? 2 : 1);
+    try {
+      // 切到临时阵容 → 服务器把修改后的战斗阵容保存到当前槽位
+      await sendMessageWithRetry(tokenId, "presetteam_saveteam", {
+        teamId: tempTeamId,
+      });
+      await delay(COMMAND_DELAY);
+      // 切回原阵容 → 服务器加载刚刚保存的最新数据
+      await sendMessageWithRetry(tokenId, "presetteam_saveteam", {
+        teamId: myTeamId,
+      });
+    } catch (err) {}
+    await delay(COMMAND_DELAY);
+
+    await refreshTeamInfo({ keepTeamId: myTeamId });
+
+    if (errors.length > 0) {
+      message.warning(`阵容已应用，但有部分错误:\n${errors.join("\n")}`);
+    } else {
+      message.success(`阵容 "${lineup.name}" 已应用`);
+    }
   } catch (error) {
     message.error(`应用阵容失败: ${error.message}`);
   } finally {
