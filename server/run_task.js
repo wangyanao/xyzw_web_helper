@@ -676,8 +676,8 @@ async function runBatchMengjing(client, tokenName, delay = 500) {
 /** 换皮闯关 */
 async function runSkinChallenge(client, tokenName, delay = 500) {
   try {
-    const res = await client.sendWithPromise('towers_getinfo', {}, 5000);
-    const towerData = res?.actId ? res : (res?.towerData?.actId ? res.towerData : res);
+    let res = await client.sendWithPromise('towers_getinfo', {}, 5000);
+    let towerData = res?.actId ? res : (res?.towerData?.actId ? res.towerData : res);
     if (!towerData?.actId) {
       log(tokenName, '换皮闯关：活动未开放', 'warning');
       return;
@@ -692,14 +692,67 @@ async function runSkinChallenge(client, tokenName, delay = 500) {
         return;
       }
     }
-    const levelRewardMap = towerData.levelRewardMap || {};
+    let levelRewardMap = towerData.levelRewardMap || {};
     const dayMap = { 5:[1], 6:[2], 0:[3], 1:[4], 2:[5], 3:[6], 4:[1,2,3,4,5,6] };
     const todayTypes = dayMap[new Date().getDay()] || [];
-    for (const type of todayTypes) {
+
+    const isTowerCleared = (type, map) => {
       const key = `${type}008`;
-      if (levelRewardMap[key] || levelRewardMap[Number(key)]) continue; // 已通关
-      await execCmd(client, tokenName, 'towers_start', { towerType: type }, `换皮闯关 BOSS${type}`, 8000);
-      await sleep(delay);
+      return !!(map[key] || map[Number(key)]);
+    };
+
+    for (const type of todayTypes) {
+      if (isTowerCleared(type, levelRewardMap)) continue;
+      log(tokenName, `换皮闯关：开始挑战 BOSS${type}`, 'info');
+
+      let needStart = true;
+      let failCount = 0;
+
+      while (!isTowerCleared(type, levelRewardMap)) {
+        if (needStart) {
+          try {
+            await client.sendWithPromise('towers_start', { towerType: type }, 8000);
+          } catch (e) {
+            // 200330 = 存在未完成挑战，可直接 fight
+            if (!e.message?.includes('200330')) {
+              log(tokenName, `换皮闯关 BOSS${type} start失败: ${e.message}`, 'warning');
+              break;
+            }
+          }
+          await sleep(delay);
+        }
+
+        try {
+          const fightRes = await client.sendWithPromise('towers_fight', { towerType: type }, 8000);
+          const curHP = fightRes?.battleData?.result?.accept?.ext?.curHP;
+
+          if (curHP === 0) {
+            log(tokenName, `换皮闯关 BOSS${type} 当层通过`, 'success');
+            needStart = false;
+            failCount = 0;
+            // 刷新进度
+            res = await client.sendWithPromise('towers_getinfo', {}, 5000);
+            towerData = res?.actId ? res : (res?.towerData?.actId ? res.towerData : res);
+            levelRewardMap = towerData?.levelRewardMap || {};
+          } else {
+            log(tokenName, `换皮闯关 BOSS${type} 当层失败`, 'warning');
+            needStart = true;
+            failCount++;
+            if (failCount >= 3) {
+              log(tokenName, `换皮闯关 BOSS${type} 连续失败3次，跳过`, 'warning');
+              break;
+            }
+          }
+        } catch (e) {
+          log(tokenName, `换皮闯关 BOSS${type} fight失败: ${e.message}`, 'warning');
+          break;
+        }
+        await sleep(delay);
+      }
+
+      if (isTowerCleared(type, levelRewardMap)) {
+        log(tokenName, `换皮闯关 BOSS${type} 全部通关`, 'success');
+      }
     }
   } catch (err) {
     log(tokenName, `换皮闯关失败: ${err.message}`, 'warning');
@@ -782,8 +835,25 @@ async function runBaoku45(client, tokenName, delay = 500) {
 }
 
 /** 爬塔（fight_starttower，耗尽体力为止）*/
-async function runClimbTower(client, tokenName, delay = 1000) {
+async function runClimbTower(client, tokenName, settings = {}, delay = 1000) {
+  let originalFormation = null;
   try {
+    // 阵容切换
+    const towerFormation = settings.towerFormation;
+    if (towerFormation) {
+      try {
+        const teamInfo = await client.sendWithPromise('presetteam_getinfo', {}, 5000);
+        originalFormation = teamInfo?.presetTeamInfo?.useTeamId;
+        if (originalFormation !== towerFormation) {
+          await client.sendWithPromise('presetteam_saveteam', { teamId: towerFormation }, 5000);
+          log(tokenName, `爬塔：切换到阵容${towerFormation}`, 'info');
+        } else {
+          originalFormation = null; // 无需切回
+        }
+      } catch (e) { log(tokenName, `阵容切换失败: ${e.message}`, 'warning'); }
+      await sleep(500);
+    }
+
     const battleVersion = await getBattleVersion(client, tokenName);
     const roleInfo = await client.sendWithPromise('role_getroleinfo', {}, 8000);
     let energy = roleInfo?.role?.tower?.energy || 0;
@@ -801,6 +871,10 @@ async function runClimbTower(client, tokenName, delay = 1000) {
           if (floor > 0) await client.sendWithPromise('tower_claimreward', { rewardId: floor }, 3000).catch(() => {});
           await sleep(3000); continue;
         }
+        if (err.message?.includes('200400')) {
+          log(tokenName, '爬塔：操作过快，等待5秒', 'warning');
+          await sleep(5000); continue;
+        }
         if (++fails >= 3) break;
         await sleep(2000);
       }
@@ -810,11 +884,37 @@ async function runClimbTower(client, tokenName, delay = 1000) {
     }
     log(tokenName, `爬塔结束，共 ${count} 次`, 'success');
   } catch (err) { log(tokenName, `爬塔失败: ${err.message}`, 'warning'); }
+  finally {
+    // 切回原阵容
+    if (originalFormation != null) {
+      try {
+        await client.sendWithPromise('presetteam_saveteam', { teamId: originalFormation }, 5000);
+        log(tokenName, `爬塔：切回阵容${originalFormation}`, 'info');
+      } catch {}
+    }
+  }
 }
 
 /** 爬怪异塔（evotower_readyfight + evotower_fight，耗尽能量）*/
-async function runClimbWeirdTower(client, tokenName, delay = 500) {
+async function runClimbWeirdTower(client, tokenName, settings = {}, delay = 500) {
+  let originalFormation = null;
   try {
+    // 阵容切换
+    const towerFormation = settings.towerFormation;
+    if (towerFormation) {
+      try {
+        const teamInfo = await client.sendWithPromise('presetteam_getinfo', {}, 5000);
+        originalFormation = teamInfo?.presetTeamInfo?.useTeamId;
+        if (originalFormation !== towerFormation) {
+          await client.sendWithPromise('presetteam_saveteam', { teamId: towerFormation }, 5000);
+          log(tokenName, `怪异塔：切换到阵容${towerFormation}`, 'info');
+        } else {
+          originalFormation = null;
+        }
+      } catch (e) { log(tokenName, `阵容切换失败: ${e.message}`, 'warning'); }
+      await sleep(500);
+    }
+
     let info = await client.sendWithPromise('evotower_getinfo', {}, 5000);
     let energy = info?.evoTower?.energy || 0;
     log(tokenName, `怪异塔：初始能量 ${energy}`);
@@ -826,11 +926,27 @@ async function runClimbWeirdTower(client, tokenName, delay = 500) {
         count++; fails = 0;
         log(tokenName, `✅ 怪异塔第 ${count} 次`, 'success');
         await sleep(delay);
-        // 通关10层领取奖励
+        // 刷新信息
         info = await client.sendWithPromise('evotower_getinfo', {}, 5000);
         const towerId = info?.evoTower?.towerId || 0;
-        if (fightRes?.winList?.[0] && (towerId % 10) === 0) {
+
+        // 检查并领取每日任务奖励
+        if (info?.evoTower?.taskClaimMap) {
+          const now = new Date();
+          const dateKey = `${String(now.getFullYear()).slice(2)}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}`;
+          const dailyTasks = info.evoTower.taskClaimMap[dateKey] || {};
+          for (const taskId of [1, 2, 3]) {
+            if (!dailyTasks[taskId]) {
+              await client.sendWithPromise('evotower_claimtask', { taskId }, 2000).catch(() => {});
+              await sleep(200);
+            }
+          }
+        }
+
+        // 通关10层领取奖励
+        if (fightRes?.winList?.[0] && ((towerId % 10) + 1) === 1) {
           await client.sendWithPromise('evotower_claimreward', {}, 5000).catch(() => {});
+          log(tokenName, `怪异塔：领取第${Math.floor(towerId / 10)}章通关奖励`, 'success');
         }
         energy = info?.evoTower?.energy || 0;
       } catch (err) {
@@ -841,6 +957,14 @@ async function runClimbWeirdTower(client, tokenName, delay = 500) {
     }
     log(tokenName, `怪异塔结束，共 ${count} 次`, 'success');
   } catch (err) { log(tokenName, `怪异塔失败: ${err.message}`, 'warning'); }
+  finally {
+    if (originalFormation != null) {
+      try {
+        await client.sendWithPromise('presetteam_saveteam', { teamId: originalFormation }, 5000);
+        log(tokenName, `怪异塔：切回阵容${originalFormation}`, 'info');
+      } catch {}
+    }
+  }
 }
 
 /** 领取怪异塔免费道具 */
@@ -876,7 +1000,7 @@ async function runUseItems(client, tokenName, delay = 500) {
   } catch (err) { log(tokenName, `使用道具失败: ${err.message}`, 'warning'); }
 }
 
-/** 合成怪异塔材料（mergebox_merge 循环）*/
+/** 合成怪异塔材料（mergebox_mergeitem 两两配对合成）*/
 async function runMergeItems(client, tokenName, delay = 500) {
   try {
     for (let loop = 0; loop < 20; loop++) {
@@ -891,16 +1015,53 @@ async function runMergeItems(client, tokenName, delay = 500) {
           await sleep(delay);
         }
       }
-      // 合成
+      // 解析 gridMap（二维结构）并按 gridItemId 分组
       const gridMap = infoRes.mergeBox.gridMap || {};
-      let merged = false;
-      for (const [k, v] of Object.entries(gridMap)) {
-        if (!v || !v.itemId) continue;
-        const [gk] = k.split(',').map(Number);
-        await client.sendWithPromise('mergebox_merge', { actType: 1, gridKey: k }, 2000).catch(() => {});
-        merged = true; await sleep(delay);
+      const items = [];
+      for (const xStr in gridMap) {
+        for (const yStr in gridMap[xStr]) {
+          const item = gridMap[xStr][yStr];
+          if (item.gridConfId == 0 && item.gridItemId > 0 && !item.isLock) {
+            items.push({ x: parseInt(xStr), y: parseInt(yStr), id: item.gridItemId });
+          }
+        }
       }
-      if (!merged) break;
+      // 按 gridItemId 分组
+      const grouped = {};
+      for (const item of items) {
+        if (!grouped[item.id]) grouped[item.id] = [];
+        grouped[item.id].push(item);
+      }
+      // 检查是否有可合成项（同类 >= 2）
+      let hasMerge = false;
+      for (const id in grouped) {
+        if (grouped[id].length >= 2) { hasMerge = true; break; }
+      }
+      if (!hasMerge) break;
+
+      // 检查是否8级以上，使用自动合成
+      const isLevel8OrAbove = taskMap['251212208'] && taskMap['251212208'] !== 0;
+      if (isLevel8OrAbove) {
+        await client.sendWithPromise('mergebox_automergeitem', { actType: 1 }, 10000).catch(() => {});
+        log(tokenName, '合成：使用自动合成', 'info');
+        await sleep(1500);
+      } else {
+        // 手动两两配对合成
+        for (const id in grouped) {
+          const group = grouped[id];
+          while (group.length >= 2) {
+            const source = group.shift();
+            const target = group.shift();
+            await client.sendWithPromise('mergebox_mergeitem', {
+              actType: 1,
+              sourcePos: { gridX: source.x, gridY: source.y },
+              targetPos: { gridX: target.x, gridY: target.y }
+            }, 2000).catch(() => {});
+            await sleep(delay);
+          }
+        }
+      }
+      await sleep(500);
     }
     log(tokenName, '✅ 合成完成', 'success');
   } catch (err) { log(tokenName, `合成失败: ${err.message}`, 'warning'); }
@@ -926,10 +1087,11 @@ async function runClaimPeachTasks(client, tokenName, delay = 500) {
     const pt = res2?.payloadTask;
     if (pt) {
       const pm = pt.progressMap || {};
-      if ((pt.legionPoint || 0) > (pm[1] || pm['1'] || 0)) {
+      const tgpm = pt.taskGroupprogressMap || {};
+      if ((pt.legionPoint || 0) > (pm[1] || pm['1'] || 0) && (tgpm[1] || tgpm['1'] || 0) < 25) {
         await execCmd(client, tokenName, 'legion_claimpayloadtaskprogress', { taskGroup: 1 }, '蟠桃园俱乐部积分奖励');
       }
-      if ((pt.selfPoint || 0) > (pm[2] || pm['2'] || 0)) {
+      if ((pt.selfPoint || 0) > (pm[2] || pm['2'] || 0) && (tgpm[2] || tgpm['2'] || 0) < 25) {
         await execCmd(client, tokenName, 'legion_claimpayloadtaskprogress', { taskGroup: 2 }, '蟠桃园个人积分奖励');
       }
     }
@@ -1913,8 +2075,8 @@ const TASK_RUNNERS = {
   batchClaimPeachTasks:     (c, n, s) => runClaimPeachTasks(c, n, s.commandDelay),
   // ── 战斗类（battleDelay）──
   batcharenafight:          (c, n, s) => runArenaFight(c, n, s, s.battleDelay || s.commandDelay),
-  climbTower:               (c, n, s) => runClimbTower(c, n, s.battleDelay || s.commandDelay),
-  climbWeirdTower:          (c, n, s) => runClimbWeirdTower(c, n, s.battleDelay || s.commandDelay),
+  climbTower:               (c, n, s) => runClimbTower(c, n, s, s.battleDelay || s.commandDelay),
+  climbWeirdTower:          (c, n, s) => runClimbWeirdTower(c, n, s, s.battleDelay || s.commandDelay),
   batchbaoku13:             (c, n, s) => runBaoku13(c, n, s.battleDelay || s.commandDelay),
   batchbaoku45:             (c, n, s) => runBaoku45(c, n, s.battleDelay || s.commandDelay),
   skinChallenge:            (c, n, s) => runSkinChallenge(c, n, s.battleDelay || s.commandDelay),
