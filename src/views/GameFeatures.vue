@@ -218,6 +218,9 @@ const connectWebSocket = () => {
       return;
     }
 
+    // 用户主动点击重连，清除被挤号标记
+    tokenStore.clearKicked(tokenId);
+
     // 统一走 tokenStore 的选择/重连逻辑，避免页面层直接重复建连
     tokenStore.selectToken(tokenId, true);
     message.info("正在建立 WebSocket 连接...");
@@ -259,8 +262,12 @@ const toggleConnection = () => {
 onMounted(() => {
   // 检查是否需要连接 WebSocket
   if (tokenStore.selectedToken) {
-    const status = tokenStore.getWebSocketStatus(tokenStore.selectedToken.id);
-    if (status === "disconnected" || status === "error") {
+    const tokenId = tokenStore.selectedToken.id;
+    const status = tokenStore.getWebSocketStatus(tokenId);
+    // 被挤号的Token不自动重连
+    if (tokenStore.isKicked(tokenId)) {
+      // 不自动连接，用户可手动点击“重新连接”
+    } else if (status === "disconnected" || status === "error") {
       connectWebSocket();
     } else if (status === "connected") {
       // 如果已连接，立即获取初始数据

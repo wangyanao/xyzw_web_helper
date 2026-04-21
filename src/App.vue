@@ -52,6 +52,7 @@ const handleVisibilityChange = () => {
     const tid = tokenStore.selectedTokenId;
     if (!tid) return;
     if (tokenStore.isManuallyDisconnected(tid)) return;
+    if (tokenStore.isKicked(tid)) return;
     // 只有 wsConnections 中有记录（本次会话曾经连接过）才重连
     if (!tokenStore.wsConnections[tid]) return;
     const status = tokenStore.getWebSocketStatus(tid);
@@ -66,7 +67,7 @@ const handleVisibilityChange = () => {
 const handlePageShow = (e) => {
   if (e.persisted) {
     const tid = tokenStore.selectedTokenId;
-    if (tid && !tokenStore.isManuallyDisconnected(tid) && tokenStore.wsConnections[tid]) {
+    if (tid && !tokenStore.isManuallyDisconnected(tid) && !tokenStore.isKicked(tid) && tokenStore.wsConnections[tid]) {
       setTimeout(() => tokenStore.selectToken(tid, true), 100);
     }
   }

@@ -502,6 +502,12 @@ async function runDailyBasic(client, tokenName, delay = 500, batchSettings = {})
     await execCmd(client, tokenName, 'dungeon_selecthero', { battleTeam: { 0: 107 } }, '咸王梦境'); await sleep(delay);
   }
 
+  // 深海灯神（每周一免费 1 次）
+  if (dow === 1 && isTodayAvail(statisticsTime['genie:daily:free:5'])) {
+    await execCmd(client, tokenName, 'genie_sweep', { genieId: 5, sweepCnt: 1 }, '深海灯神免费扫荡');
+    await sleep(delay);
+  }
+
   // ── 9. 竞技场PK（需在任务积分领取前执行，避免积分判定时机过早）──
   if (arenaEnable) {
     await runArenaFight(client, tokenName, batchSettings, delay);
@@ -765,6 +771,20 @@ async function runGenieSweep(client, tokenName, delay = 500) {
     const roleInfoRes = await client.sendWithPromise('role_getroleinfo', {}, 5000);
     const role = roleInfoRes?.role || roleInfoRes?.data?.role || {};
     const genieData = role.genie || {};
+    const statisticsTime = role.statisticsTime || {};
+
+    const isTodayAvail = (t) => {
+      if (!t) return true;
+      return new Date().toDateString() !== new Date(Number(t) * 1000).toDateString();
+    };
+
+    // 潜入深海：每周一免费 1 次，优先执行，不受扫荡券数量限制
+    const dow = new Date().getDay();
+    if (dow === 1 && isTodayAvail(statisticsTime['genie:daily:free:5'])) {
+      await execCmd(client, tokenName, 'genie_sweep', { genieId: 5, sweepCnt: 1 }, '深海灯神免费扫荡');
+      await sleep(delay);
+    }
+
     const sweepTicketCount = role.items?.[1021]?.quantity || 0;
     if (sweepTicketCount <= 0) {
       log(tokenName, '灯神扫荡：扫荡券不足', 'warning');
@@ -1327,6 +1347,71 @@ async function runSmartSendCar(client, tokenName, settings = {}, delay = 500) {
       log(tokenName, `剩余刷新券: ${refreshTickets}`);
     } catch (_) {}
 
+    // 预加载护卫数据（红车优先绑定高红淬护卫）
+    let helperUsageMap = {};
+    let sortedHelpers = [];
+    let currentRoleId = null;
+
+    const updateHelperUsage = async () => {
+      try {
+        const resp = await client.sendWithPromise('car_getmemberhelpingcnt', {}, 5000);
+        helperUsageMap = resp?.body?.memberHelpingCntMap || resp?.memberHelpingCntMap || {};
+      } catch (_) {
+        helperUsageMap = helperUsageMap || {};
+      }
+    };
+
+    try {
+      const roleRes = await client.sendWithPromise('role_getroleinfo', {}, 8000);
+      currentRoleId = roleRes?.role?.roleId ? String(roleRes.role.roleId) : null;
+    } catch (_) {}
+
+    try {
+      await updateHelperUsage();
+      const legionRes = await client.sendWithPromise('legion_getinfo', {}, 8000);
+      const membersMap = legionRes?.info?.members || legionRes?.body?.info?.members || {};
+      const members = Object.values(membersMap || {});
+
+      sortedHelpers = members
+        .filter((m) => !currentRoleId || String(m?.roleId) !== currentRoleId)
+        .map((m) => ({
+          id: String(m?.roleId || ''),
+          name: m?.name || m?.nickname || String(m?.roleId || ''),
+          redQuench: Number(m?.custom?.red_quench_cnt || 0),
+        }))
+        .filter((m) => m.id)
+        .sort((a, b) => b.redQuench - a.redQuench);
+
+      log(tokenName, `护卫候选成员: ${sortedHelpers.length}（按红淬降序）`);
+    } catch (e) {
+      log(tokenName, `获取护卫数据失败，降级为不带护卫发车: ${e.message}`, 'warning');
+      sortedHelpers = [];
+    }
+
+    const resolveHelperIdForCar = async (car) => {
+      const color = Number(car?.color || 0);
+      // 仅红(5)及以上自动拉护卫
+      if (color < 5) return 0;
+
+      const existing = Number(car?.helperId || car?.guardId || car?.helperBattleTeam?.roleId || 0);
+      if (existing > 0) return existing;
+
+      if (!sortedHelpers.length) return 0;
+
+      // 每次分配前刷新使用次数，避免并发超限
+      await updateHelperUsage();
+
+      const best = sortedHelpers.find((h) => Number(helperUsageMap[h.id] || 0) < 4);
+      if (!best) {
+        log(tokenName, `车辆[${gradeLabel(color)}] 需护卫，但所有护卫次数已满`, 'warning');
+        return 0;
+      }
+
+      helperUsageMap[best.id] = Number(helperUsageMap[best.id] || 0) + 1;
+      log(tokenName, `车辆[${gradeLabel(color)}] 自动分配护卫: ${best.name}（红淬${best.redQuench}，已助战 ${helperUsageMap[best.id]}/4）`, 'info');
+      return Number(best.id);
+    };
+
     let sent = 0;
     for (const car of cars) {
       const sendAt = Number(car.sendAt ?? car.sendtime ?? car.send_at ?? 0);
@@ -1337,7 +1422,8 @@ async function runSmartSendCar(client, tokenName, settings = {}, delay = 500) {
       // 1. 检查是否满足发车条件
       if (shouldSendCar(car, effectiveTickets, minColor, customConditions, useGoldRefreshFallback, matchAll)) {
         log(tokenName, `车辆[${gradeLabel(car.color)}] 满足条件，直接发车`);
-        await execCmd(client, tokenName, 'car_send', { carId: String(car.id), helperId: 0, text: '', isUpgrade: false }, `发车[${gradeLabel(car.color)}]`, 10000);
+        const helperId = await resolveHelperIdForCar(car);
+        await execCmd(client, tokenName, 'car_send', { carId: String(car.id), helperId, text: '', isUpgrade: false }, `发车[${gradeLabel(car.color)}]`, 10000);
         sent++;
         await sleep(delay);
         continue;
@@ -1356,7 +1442,8 @@ async function runSmartSendCar(client, tokenName, settings = {}, delay = 500) {
       } else {
         // 无法刷新，直接发车
         log(tokenName, `车辆[${gradeLabel(car.color)}] 不满足条件且无刷新次数，直接发车`, 'warning');
-        await execCmd(client, tokenName, 'car_send', { carId: String(car.id), helperId: 0, text: '', isUpgrade: false }, `发车[${gradeLabel(car.color)}]`, 10000);
+        const helperId = await resolveHelperIdForCar(car);
+        await execCmd(client, tokenName, 'car_send', { carId: String(car.id), helperId, text: '', isUpgrade: false }, `发车[${gradeLabel(car.color)}]`, 10000);
         sent++;
         await sleep(delay);
         continue;
@@ -1387,7 +1474,8 @@ async function runSmartSendCar(client, tokenName, settings = {}, delay = 500) {
         // 刷新后检查是否满足条件
         if (shouldSendCar(car, useGoldRefreshFallback ? 999 : refreshTickets, minColor, customConditions, useGoldRefreshFallback, matchAll)) {
           log(tokenName, `刷新后车辆[${gradeLabel(car.color)}] 满足条件，发车`, 'success');
-          await execCmd(client, tokenName, 'car_send', { carId: String(car.id), helperId: 0, text: '', isUpgrade: false }, `发车[${gradeLabel(car.color)}]`, 10000);
+          const helperId = await resolveHelperIdForCar(car);
+          await execCmd(client, tokenName, 'car_send', { carId: String(car.id), helperId, text: '', isUpgrade: false }, `发车[${gradeLabel(car.color)}]`, 10000);
           sent++;
           await sleep(delay);
           break;
@@ -1405,7 +1493,8 @@ async function runSmartSendCar(client, tokenName, settings = {}, delay = 500) {
         } else {
           // 无法继续刷新，直接发车
           log(tokenName, `车辆[${gradeLabel(car.color)}] 刷新结束（无票），直接发车`, 'warning');
-          await execCmd(client, tokenName, 'car_send', { carId: String(car.id), helperId: 0, text: '', isUpgrade: false }, `发车[${gradeLabel(car.color)}]`, 10000);
+          const helperId = await resolveHelperIdForCar(car);
+          await execCmd(client, tokenName, 'car_send', { carId: String(car.id), helperId, text: '', isUpgrade: false }, `发车[${gradeLabel(car.color)}]`, 10000);
           sent++;
           await sleep(delay);
           break;

@@ -451,6 +451,18 @@ export const useTokenStore = defineStore("tokens", () => {
     return manuallyDisconnectedTokens.value.has(tokenId);
   };
 
+  // 被挤号的 Token 集合（仅内存，不持久化）
+  // 阻止本次会话内的自动重连，但刷新页面后清空，允许重新连接
+  const kickedTokens = ref(new Set<string>());
+
+  const isKicked = (tokenId: string) => {
+    return kickedTokens.value.has(tokenId);
+  };
+
+  const clearKicked = (tokenId: string) => {
+    kickedTokens.value.delete(tokenId);
+  };
+
   // 尝试自动刷新Token
   const attemptTokenRefresh = async (tokenId: string, forceReconnect = false) => {
     // 检查冷却时间 (10秒)
@@ -584,6 +596,29 @@ export const useTokenStore = defineStore("tokens", () => {
       if (message.error) {
         const errText = String(message.error).toLowerCase();
         gameLogger.warn(`消息处理跳过 [${tokenId}]:`, message.error);
+
+        // 被其他设备挤号：仅在本次会话内阻止自动重连，刷新页面后可重连
+        // 游戏源码(source/4.js)中: "other login" === e._raw.error ? c.error("账号已掉线")
+        if (errText.includes("other login")) {
+          wsLogger.warn(`检测到账号被其他设备登录，停止自动重连（刷新页面可恢复） [${tokenId}]`);
+          kickedTokens.value.add(tokenId);
+          const conn = wsConnections.value[tokenId];
+          if (conn) {
+            conn.status = "error";
+            conn.lastError = {
+              timestamp: new Date().toISOString(),
+              error: "账号已在其他设备登录，已停止自动重连",
+            };
+          }
+          // 取消任何已排期的重连定时器
+          const rs = tokenReconnectState.value[tokenId];
+          if (rs?.timerId) {
+            clearTimeout(rs.timerId);
+            rs.timerId = null;
+          }
+          return;
+        }
+
         if (errText.includes("token") && errText.includes("expired")) {
           const conn = wsConnections.value[tokenId];
           if (conn) {
@@ -845,7 +880,7 @@ export const useTokenStore = defineStore("tokens", () => {
   ) => {
     wsLogger.info(`开始创建连接: ${tokenId}`);
 
-    // 用户发起连接，清除「主动断开」标记
+    // 用户主动发起连接，清除「主动断开」标记（被挤号标记不在此清除，由调用方显式 clearKicked）
     manuallyDisconnectedTokens.value.delete(tokenId);
     _syncManuallyDisconnected();
 
@@ -983,6 +1018,11 @@ export const useTokenStore = defineStore("tokens", () => {
           wsLogger.info(`Token已被用户主动断开，跳过自动重连 [${tokenId}]`);
           return;
         }
+        // 被挤号的 Token 本次会话内不自动重连
+        if (kickedTokens.value.has(tokenId)) {
+          wsLogger.info(`Token被其他设备挤号，本次会话内跳过自动重连 [${tokenId}]`);
+          return;
+        }
         // wsConnections[tokenId] 被主动删除（closeWebSocketConnectionAsync）则说明用户主动断开，不重连
         const currConn = wsConnections.value[tokenId];
         if (!currConn) return;
@@ -1006,6 +1046,10 @@ export const useTokenStore = defineStore("tokens", () => {
             // 定时器触发时再次检查：用户可能在等待期间手动断开了
             if (manuallyDisconnectedTokens.value.has(tokenId)) {
               wsLogger.info(`Token已被用户主动断开，取消定时重连 [${tokenId}]`);
+              return;
+            }
+            if (kickedTokens.value.has(tokenId)) {
+              wsLogger.info(`Token已被挤号，取消定时重连 [${tokenId}]`);
               return;
             }
             const c = wsConnections.value[tokenId];
@@ -1796,6 +1840,8 @@ export const useTokenStore = defineStore("tokens", () => {
     createWebSocketConnection,
     closeWebSocketConnection,
     isManuallyDisconnected,
+    isKicked,
+    clearKicked,
     getWebSocketStatus,
     getWebSocketClient,
     sendMessage,
